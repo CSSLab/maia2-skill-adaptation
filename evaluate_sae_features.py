@@ -73,7 +73,7 @@ def main() -> None:
             for i, (feature_index, threshold, precision, recall, f1) in enumerate(concept_results[:N], 1):
                 print(f"{i}. Feature {feature_index}: F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}")
 
-    with open('sae_feature_evaluation_results.pickle', 'wb') as f:
+    with open('sae_feature_evaluation_results_balanced.pickle', 'wb') as f:
         pickle.dump(results, f)
 
 if __name__=="__main__":

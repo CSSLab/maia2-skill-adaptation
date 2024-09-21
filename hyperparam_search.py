@@ -30,7 +30,10 @@ from collections import defaultdict
 import concurrent.futures
 import einops
 import time
+from itertools import product
 import threading
+from get_self_implemented_concepts import in_check, can_capture_queen_mine, can_capture_queen_opponent, capture_possible_on_d2_mine
+from evaluate_sae_features import *
 
 _thread_local = threading.local()
 
@@ -115,15 +118,54 @@ def _enable_activation_hook(model, cfg):
         feedforward_module = model.module.transformer.elo_layers[i][1]
         feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
 
+def evaluate_sae_features_in_train(split_activations, sae, key, board_fen, function_map):
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    split_activations = split_activations.to(device)
+    sae_weight = sae[key]['encoder_DF.weight'].to(device)
+    sae_bias = sae[key]['encoder_DF.bias'].to(device)
+
+    encoded = nn.functional.linear(split_activations, sae_weight, sae_bias)
+    encoded = nn.functional.relu(encoded)
+    activations = {}
+    activations[key] = encoded
+    num_cores = min(72, cpu_count())
+    n_features = split_activations.shape[1]
+    results = {}
+
+    samples_and_activations = cache_examples_and_activations(list(function_map.values()), list(function_map.keys()), activations, board_fen)
+    for concept_name, concept_func in function_map.items():
+        sampled_sae_activations = samples_and_activations[concept_name][key]
+        ground_truth = torch.cat((samples_and_activations[concept_name]["positives"], samples_and_activations[concept_name]["negatives"]))
+        sampled_sae_activations = sampled_sae_activations.cpu()
+        ground_truth = ground_truth.cpu()
+        args_list = [(i, sampled_sae_activations[:, i], ground_truth) for i in range(n_features)]
+            
+        with Pool(num_cores) as pool:
+            concept_results = list(tqdm.tqdm(pool.imap(process_sae_feature, args_list), total=n_features))
+
+        concept_results.sort(key=lambda x: x[4], reverse=True)
+        results[concept_name] = concept_results
+        top_feature = concept_results[0]
+        print(f"Best feature for {concept_name}:")
+        # print(f"Feature index: {top_feature[0]}")
+        # print(f"Best threshold: {top_feature[1]:.4f}")
+        # print(f"Precision: {top_feature[2]:.4f}")
+        # print(f"Recall: {top_feature[3]:.4f}")
+        print(f"F1-score: {top_feature[4]:.4f}")
+
 def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epochs, buffer_size=8192, l1_coefficient=0.00001):
     _enable_activation_hook(model, cfg)
-    
+
+    concept_functions = {"in_check": in_check,
+                         "has_bishop_pair_opponent": has_bishop_pair_opponent,
+                         "has_connected_rooks_opponent": has_connected_rooks_opponent,
+                         "can_capture_queen_mine": can_capture_queen_mine, 
+                         "has_contested_open_file": has_contested_open_file,
+                         "has_control_of_open_file_mine": has_control_of_open_file_mine, 
+                         "capture_possible_on_d2_mine": capture_possible_on_d2_mine,
+                         "capture_possible_on_b5_opponent": capture_possible_on_b5_opponent,
+    }
     target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
-    
-    saes = {key: SparseAutoEncoder(activation_dim=cfg.dim_vit, dict_size=cfg.dim_vit * 4) for key in target_key_list}
-    optimizers = {key: optim.Adam(saes[key].parameters(), lr=3e-4) for key in target_key_list}
-    
-    buffers = {key: ActivationBuffer(buffer_size * cfg.vit_length, cfg.dim_vit) for key in target_key_list}
     pgn_path = cfg.data_root + f"/lichess_db_standard_rated_{cfg.test_year}-{formatted_month}.pgn"
 
     # Initialize monitoring variables
@@ -133,76 +175,93 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
     total_l2_losses = {key: 0.0 for key in target_key_list}
     total_l1_losses = {key: 0.0 for key in target_key_list}
     
-    print(f"Starting SAE training pipeline for {num_epochs} epochs")
+    print(f"Starting SAE hyperparameter tuning pipeline for {num_epochs} epochs")
     
-    for epoch in range(num_epochs):
-        epoch_start_time = time.time()
-        total_batches = 0
-        
-        for i in range(0, len(pgn_chunks), cfg.num_workers):
-            pgn_chunks_sublist = pgn_chunks[i:i + cfg.num_workers]
-            data, game_count, chunk_count = process_chunks(cfg, pgn_path, pgn_chunks_sublist, elo_dict)
-            dataset = MAIA2Dataset(data, all_moves_dict, cfg)
-            dataloader = torch.utils.data.DataLoader(dataset, 
-                                                batch_size=cfg.batch_size, 
-                                                shuffle=False, 
-                                                drop_last=False,
-                                                num_workers=cfg.num_workers)
-            
-            total_batches += len(dataloader)
-            
-            for batch_idx, (boards, moves, elos_self, elos_oppo, legal_moves, side_info, active_win, board_input) in enumerate(dataloader):
-                logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
-                activations = getattr(_thread_local, 'activations', {})
+    hidden_dims = [1024, 2048, 4096]
+    l1_coefficients = [1e-5, 5e-5, 1e-4]
 
-                for key in target_key_list:
-                    if key in activations:
-                        split_activations = activations[key].view(-1, cfg.dim_vit)
-                        is_buffer_full = buffers[key].add(split_activations)
-                        
-                        if is_buffer_full:
-                            total_loss, l2_loss, l1_loss = train_sae(saes[key], optimizers[key], buffers[key].get_data(), l1_coefficient)
-                            buffers[key].clear()
-                            
-                            total_sae_updates[key] += 1
-                            total_losses[key] += total_loss.item()
-                            total_l2_losses[key] += l2_loss.item()
-                            total_l1_losses[key] += l1_loss.item()
-                            
-                            if total_sae_updates[key] % 100 == 0:
-                                avg_total_loss = total_losses[key] / total_sae_updates[key]
-                                avg_l2_loss = total_l2_losses[key] / total_sae_updates[key]
-                                avg_l1_loss = total_l1_losses[key] / total_sae_updates[key]
-                                print(f"Epoch {epoch+1}/{num_epochs}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
-                                    f"Batch {batch_idx+1}/{len(dataloader)}, "
-                                    f"Key: {key}, Updates: {total_sae_updates[key]}, "
-                                    f"Avg Total Loss: {avg_total_loss:.4f}, "
-                                    f"Avg L2 Loss: {avg_l2_loss:.4f}, "
-                                    f"Avg L1 Loss: {avg_l1_loss:.4f}")
-                
-                if hasattr(_thread_local, 'activations'):
-                    _thread_local.activations.clear()
-                
-                # Print overall progress every 1000 batches
-                if (batch_idx + 1) % 1000 == 0:
-                    elapsed_time = time.time() - start_time
-                    print(f"Epoch {epoch+1}/{num_epochs}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
-                          f"Batch {batch_idx+1}/{len(dataloader)}, Elapsed Time: {elapsed_time:.2f}s")
+    for hidden_dim, l1_coefficient in product(hidden_dims, l1_coefficients):
+        print(f"HP Setting: SAE hidden dimension = {hidden_dim}; l1 coefficient = {l1_coefficient}")
+        saes = {key: SparseAutoEncoder(activation_dim=cfg.dim_vit, dict_size=hidden_dim) for key in target_key_list}
+        optimizers = {key: optim.Adam(saes[key].parameters(), lr=3e-4) for key in target_key_list}
+        buffers = {key: ActivationBuffer(buffer_size * cfg.vit_length, cfg.dim_vit) for key in target_key_list}
         
+        for epoch in range(num_epochs):
+            # epoch_start_time = time.time()
+            total_batches = 0
+            
+            for i in range(0, len(pgn_chunks), cfg.num_workers):
+                pgn_chunks_sublist = pgn_chunks[i:i + cfg.num_workers]
+                data, game_count, chunk_count = process_chunks(cfg, pgn_path, pgn_chunks_sublist, elo_dict)
+                dataset = MAIA2Dataset(data, all_moves_dict, cfg)
+                dataloader = torch.utils.data.DataLoader(dataset, 
+                                                    batch_size=cfg.batch_size, 
+                                                    shuffle=False, 
+                                                    drop_last=False,
+                                                    num_workers=cfg.num_workers)
+                
+                total_batches += len(dataloader)
+                
+                for batch_idx, (boards, moves, elos_self, elos_oppo, legal_moves, side_info, active_win, board_fen) in enumerate(dataloader):
+                    logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
+                    activations = getattr(_thread_local, 'activations', {})
+
+                    for key in target_key_list:
+                        if key in activations:
+                            split_activations = activations[key].view(-1, cfg.dim_vit)
+                            is_buffer_full = buffers[key].add(split_activations)
+                            
+                            if is_buffer_full:
+                                total_loss, l2_loss, l1_loss = train_sae(saes[key], optimizers[key], buffers[key].get_data(), l1_coefficient)
+                                buffers[key].clear()
+                                
+                                total_sae_updates[key] += 1
+                                total_losses[key] += total_loss.item()
+                                total_l2_losses[key] += l2_loss.item()
+                                total_l1_losses[key] += l1_loss.item()
+                                
+                                if total_sae_updates[key] % 10 == 0:
+                                    sae_state_dicts = {}
+                                    for key, sae in saes.items():
+                                        sae_state_dicts[key] = sae.state_dict()
+                                    print(f"Feature Calibration for SAE dim = {hidden_dim}, l1 coefficient = {l1_coefficient} on Layer {key}:")
+                                    evaluate_sae_features_in_train(split_activations, sae_state_dicts, key, board_fen, concept_functions)
+                                    avg_total_loss = total_losses[key] / total_sae_updates[key]
+                                    avg_l2_loss = total_l2_losses[key] / total_sae_updates[key]
+                                    avg_l1_loss = total_l1_losses[key] / total_sae_updates[key]
+                                    print(f"Epoch {epoch+1}/{num_epochs}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
+                                        f"Batch {batch_idx+1}/{len(dataloader)}, "
+                                        f"Key: {key}, Updates: {total_sae_updates[key]}, "
+                                        f"Avg Total Loss: {avg_total_loss:.4f}, "
+                                        f"Avg L2 Loss: {avg_l2_loss:.4f}, "
+                                        f"Avg L1 Loss: {avg_l1_loss:.4f}")
+                    
+                    if hasattr(_thread_local, 'activations'):
+                        _thread_local.activations.clear()
+                    
+                    # Print overall progress every 1000 batches
+                    if (batch_idx + 1) % 1000 == 0:
+                        elapsed_time = time.time() - start_time
+                        print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx + 1}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
+                            f"Batch {batch_idx+1}/{len(dataloader)}, Elapsed Time: {elapsed_time:.2f}s")
+
+                    if total_sae_updates[key] >= 1000:
+                        break
+
         # Print epoch summary
-        epoch_time = time.time() - epoch_start_time
-        print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.2f}s")
-        print(f"Total batches processed: {total_batches}")
-        for key in target_key_list:
-            avg_loss = total_losses[key] / max(total_sae_updates[key], 1)
-            print(f"  {key}: Total Updates: {total_sae_updates[key]}, Avg Loss: {avg_loss:.4f}")
-        print()
+    #     epoch_time = time.time() - epoch_start_time
+    #     print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.2f}s")
+    #     print(f"Total batches processed: {total_batches}")
+    #     for key in target_key_list:
+    #         avg_loss = total_losses[key] / max(total_sae_updates[key], 1)
+    #         print(f"  {key}: Total Updates: {total_sae_updates[key]}, Avg Loss: {avg_loss:.4f}")
+    #     print()
     
-    total_time = time.time() - start_time
-    print(f"\nSAE training completed in {total_time:.2f}s")
-    for key in target_key_list:
-        avg_loss = total_losses[key] / max(total_sae_updates[key], 1)
-        print(f"  {key}: Total Updates: {total_sae_updates[key]}, Final Avg Loss: {avg_loss:.4f}")
+    # total_time = time.time() - start_time
+    # print(f"\nSAE training completed in {total_time:.2f}s")
+    # for key in target_key_list:
+    #     avg_loss = total_losses[key] / max(total_sae_updates[key], 1)
+    #     print(f"  {key}: Total Updates: {total_sae_updates[key]}, Final Avg Loss: {avg_loss:.4f}")
     
     return saes
 
@@ -271,7 +330,7 @@ if __name__ == '__main__':
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
     trained_model_path = "weights.v2.pt"
-    ckpt = torch.load(trained_model_path, map_location=torch.device('cuda:0'))
+    ckpt = torch.load(trained_model_path, map_location=torch.device('cuda:1'))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
     model = torch.nn.DataParallel(model)
     model.load_state_dict(ckpt['model_state_dict'])
@@ -283,11 +342,9 @@ if __name__ == '__main__':
     print(f'Testing Mixed Elo with {len(pgn_chunks)} chunks from {pgn_path}: ', flush=True)
 
     trained_saes = train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epochs=cfg.num_sae_epochs)
-    sae_state_dicts = {}
-    for key, sae in trained_saes.items():
-        sae_state_dicts[key] = sae.state_dict()
-    save_path = f'sae/trained_saes_{cfg.test_year}-{formatted_month}-new.pt'
-    torch.save(sae_state_dicts, save_path)
-    print(f"Trained SAEs saved to {save_path}. Finished")
-    
-    
+    # sae_state_dicts = {}
+    # for key, sae in trained_saes.items():
+    #     sae_state_dicts[key] = sae.state_dict()
+    # save_path = f'sae/trained_saes_{cfg.test_year}-{formatted_month}-new.pt'
+    # torch.save(sae_state_dicts, save_path)
+    # print(f"Trained SAEs saved to {save_path}. Finished")
