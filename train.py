@@ -31,6 +31,7 @@ import concurrent.futures
 import einops
 import time
 import threading
+from hyperparam_search import * 
 
 _thread_local = threading.local()
 
@@ -106,21 +107,101 @@ def calculate_loss(autoencoder: SparseAutoEncoder, model_activations_BD: torch.T
 def _enable_activation_hook(model, cfg):
     def get_activation(name):
         def hook(model, input, output):
-            if not hasattr(_thread_local, 'activations'):
-                _thread_local.activations = {}
-            _thread_local.activations[name] = output.detach()
+            if not hasattr(_thread_local, 'residual_streams'):
+                _thread_local.residual_streams = {}
+            _thread_local.residual_streams[name] = output.detach()
         return hook
-    
+        
+    def get_attention_head(name):
+        def hook(module, input, output):
+            if not hasattr(_thread_local, 'attention_heads'):
+                _thread_local.attention_heads = {}
+            batch_size, seq_len, _ = output.shape
+            # 16 attention heads. each 64 dim
+            reshaped_output = output.view(batch_size, seq_len, 16, 64)
+            for head_idx in range(16):
+                head_activation = reshaped_output[:, :, head_idx, :]
+                _thread_local.attention_heads[f'{name}_head_{head_idx}'] = head_activation.detach()
+        return hook
+
+    def get_mlp_output(name):
+        def hook(module, input, output):
+            if not hasattr(_thread_local, 'mlp_outputs'):
+                _thread_local.mlp_outputs = {}
+            _thread_local.mlp_outputs[name] = output.detach()
+        return hook
+        
     for i in range(cfg.num_blocks_vit):
-        feedforward_module = model.module.transformer.elo_layers[i][1]
-        feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
+        if cfg.sae_residual_streams:
+            feedforward_module = model.module.transformer.elo_layers[i][1]
+            feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
+        if cfg.sae_attention_heads:
+            attention_module = model.module.transformer.elo_layers[i][0]
+            attention_module.register_forward_hook(get_attention_head(f'transformer block {i} attention heads'))
+        if cfg.sae_mlp_outputs:
+            mlp_module = model.module.transformer.elo_layers[i][1].net
+            mlp_module.register_forward_hook(get_mlp_output(f'transformer block {i} MLP outputs'))
+
+
+# def _enable_activation_hook(model, cfg):
+#     def get_activation(name):
+#         def hook(model, input, output):
+#             if not hasattr(_thread_local, 'activations'):
+#                 _thread_local.activations = {}
+#             _thread_local.activations[name] = output.detach()
+#         return hook
+    
+#     for i in range(cfg.num_blocks_vit):
+#         feedforward_module = model.module.transformer.elo_layers[i][1]
+#         feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
 
 def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epochs, buffer_size=8192, l1_coefficient=0.00001):
+    
+    concept_functions = {
+        "in_check": in_check,
+        "has_mate_threat": has_mate_threat,
+        "has_connected_rooks_mine": has_connected_rooks_mine,
+        "has_connected_rooks_opponent": has_connected_rooks_opponent,
+        "has_bishop_pair_mine": has_bishop_pair_mine,
+        "has_bishop_pair_opponent": has_bishop_pair_opponent,
+        "has_control_of_open_file_mine": has_control_of_open_file_mine,
+        "has_control_of_open_file_opponent": has_control_of_open_file_opponent,
+        "can_capture_queen_mine": can_capture_queen_mine,
+        "can_capture_queen_opponent": can_capture_queen_opponent,
+        "has_contested_open_file": has_contested_open_file,
+        "has_right_bc_ha_promotion_mine": has_right_bc_ha_promotion_mine,
+        "has_right_bc_ha_promotion_opponent": has_right_bc_ha_promotion_opponent,
+        "capture_possible_on_d1_mine": capture_possible_on_d1_mine,
+        "capture_possible_on_d2_mine": capture_possible_on_d2_mine,
+        "capture_possible_on_d3_mine": capture_possible_on_d3_mine,
+        "capture_possible_on_e1_mine": capture_possible_on_e1_mine,
+        "capture_possible_on_e2_mine": capture_possible_on_e2_mine,
+        "capture_possible_on_e3_mine": capture_possible_on_e3_mine,
+        "capture_possible_on_g5_mine": capture_possible_on_g5_mine,
+        "capture_possible_on_b5_mine": capture_possible_on_b5_mine,
+        "capture_possible_on_d1_opponent": capture_possible_on_d1_opponent,
+        "capture_possible_on_d2_opponent": capture_possible_on_d2_opponent,
+        "capture_possible_on_d3_opponent": capture_possible_on_d3_opponent,
+        "capture_possible_on_e1_opponent": capture_possible_on_e1_opponent,
+        "capture_possible_on_e2_opponent": capture_possible_on_e2_opponent,
+        "capture_possible_on_e3_opponent": capture_possible_on_e3_opponent,
+        "capture_possible_on_g5_opponent": capture_possible_on_g5_opponent,
+        "capture_possible_on_b5_opponent": capture_possible_on_b5_opponent,
+    }
+    
     _enable_activation_hook(model, cfg)
-    
-    target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
-    
-    saes = {key: SparseAutoEncoder(activation_dim=cfg.dim_vit, dict_size=cfg.dim_vit * 4) for key in target_key_list}
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    assert cfg.sae_attention_heads + cfg.sae_mlp_outputs + cfg.sae_residual_streams == 1
+    if cfg.sae_attention_heads:
+        target_key_list = ['transformer block 0 attention heads', 'transformer block 1 attention heads']
+    if cfg.sae_mlp_outputs:
+        target_key_list = ['transformer block 0 MLP outputs', 'transformer block 1 MLP outputs']
+    if cfg.sae_residual_streams:
+        target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
+
+    saes = {key: SparseAutoEncoder(activation_dim=cfg.dim_vit, dict_size=cfg.sae_dim) for key in target_key_list}
     optimizers = {key: optim.Adam(saes[key].parameters(), lr=3e-4) for key in target_key_list}
     
     buffers = {key: ActivationBuffer(buffer_size * cfg.vit_length, cfg.dim_vit) for key in target_key_list}
@@ -132,6 +213,12 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
     total_losses = {key: 0.0 for key in target_key_list}
     total_l2_losses = {key: 0.0 for key in target_key_list}
     total_l1_losses = {key: 0.0 for key in target_key_list}
+
+    # Initialize variables for calibration and early stopping
+    best_auc_sum = {key: 0 for key in target_key_list}
+    patience = 5
+    patience_counter = {key: 0 for key in target_key_list}
+    early_stop = False
     
     print(f"Starting SAE training pipeline for {num_epochs} epochs")
     
@@ -152,8 +239,38 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
             total_batches += len(dataloader)
             
             for batch_idx, (boards, moves, elos_self, elos_oppo, legal_moves, side_info, active_win, board_input) in enumerate(dataloader):
+                # device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+                moves = moves.to(device)
+                boards = boards.to(device)
+                elos_self = elos_self.to(device)
+                elos_oppo = elos_oppo.to(device)
+                legal_moves = legal_moves.to(device)
+                
                 logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
-                activations = getattr(_thread_local, 'activations', {})
+                
+                if cfg.sae_attention_heads:
+
+                    # Concat all attention heads into dim_vit
+                    tmp_activations = getattr(_thread_local, 'attention_heads', {})
+                    activations = {}
+
+                    for key in target_key_list:
+                        all_heads = []
+                        for i in range(16):
+                            heads_name = key + f"_head_{i}"
+                            tmp_att_head = tmp_activations[heads_name]
+                            all_heads.append(tmp_att_head)
+
+                        concatenated_att = torch.cat(all_heads, dim=-1)
+                        assert concatenated_att.shape[-1] == cfg.dim_vit
+                        activations[key] = concatenated_att
+
+                if cfg.sae_mlp_outputs:
+                    activations = getattr(_thread_local, 'mlp_outputs', {})
+                if cfg.sae_residual_streams:
+                    activations = getattr(_thread_local, 'residual_streams', {})
+
+                # print(activations[target_key_list[0]].shape)
 
                 for key in target_key_list:
                     if key in activations:
@@ -169,7 +286,14 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
                             total_l2_losses[key] += l2_loss.item()
                             total_l1_losses[key] += l1_loss.item()
                             
-                            if total_sae_updates[key] % 100 == 0:
+                            if total_sae_updates[key] % 500 == 0:
+                                # sae_state_dicts = {}
+                                # for temp_key, sae in saes.items():
+                                #     sae_state_dicts[temp_key] = sae.state_dict()
+                                # print(f"Feature Calibration for SAE dim = {cfg.sae_dim}, l1 coefficient = {l1_coefficient} on Layer {key}:")
+                                # str_res, str_auc = evaluate_sae_features_in_train_strategic(split_activations, sae_state_dicts, key, board_input, concept_functions)
+                                # brd_res, brd_auc = evaluate_sae_features_in_train_board_state(split_activations, sae_state_dicts, key, board_input)
+                                
                                 avg_total_loss = total_losses[key] / total_sae_updates[key]
                                 avg_l2_loss = total_l2_losses[key] / total_sae_updates[key]
                                 avg_l1_loss = total_l1_losses[key] / total_sae_updates[key]
@@ -179,16 +303,36 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
                                     f"Avg Total Loss: {avg_total_loss:.4f}, "
                                     f"Avg L2 Loss: {avg_l2_loss:.4f}, "
                                     f"Avg L1 Loss: {avg_l1_loss:.4f}")
+
+                                # current_auc_sum = str_auc + brd_auc
+                                # if current_auc_sum > best_auc_sum[key]:
+                                #     best_auc_sum[key] = current_auc_sum
+                                #     patience_counter[key] = 0
+                                # else:
+                                #     patience_counter[key] += 1
+
+                                # if patience_counter[key] >= patience:
+                                #     print(f"Early stopping condition met for layer: {key}")
+                                #     if all(patience_counter[k] >= patience for k in target_key_list):
+                                #         print("Early stopping condition met for all layers. Stopping training.")
+                                #         early_stop = True
+                                #         break
                 
                 if hasattr(_thread_local, 'activations'):
                     _thread_local.activations.clear()
                 
+                if early_stop:
+                    break
+
                 # Print overall progress every 1000 batches
                 if (batch_idx + 1) % 1000 == 0:
                     elapsed_time = time.time() - start_time
-                    print(f"Epoch {epoch+1}/{num_epochs}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx + 1}, Chunk {i//cfg.num_workers + 1}/{len(pgn_chunks)//cfg.num_workers}, "
                           f"Batch {batch_idx+1}/{len(dataloader)}, Elapsed Time: {elapsed_time:.2f}s")
         
+            if early_stop:
+                break
+
         # Print epoch summary
         epoch_time = time.time() - epoch_start_time
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.2f}s")
@@ -197,6 +341,9 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
             avg_loss = total_losses[key] / max(total_sae_updates[key], 1)
             print(f"  {key}: Total Updates: {total_sae_updates[key]}, Avg Loss: {avg_loss:.4f}")
         print()
+
+        if early_stop:
+            break
     
     total_time = time.time() - start_time
     print(f"\nSAE training completed in {total_time:.2f}s")
@@ -205,12 +352,6 @@ def train_sae_pipeline(model, cfg, pgn_chunks, all_moves_dict, elo_dict, num_epo
         print(f"  {key}: Total Updates: {total_sae_updates[key]}, Final Avg Loss: {avg_loss:.4f}")
     
     return saes
-
-def perform_intervention(model_activations_D: torch.Tensor, decoder_FD: torch.Tensor, scale: float) -> torch.Tensor:
-    intervention_vector_D = decoder_FD[317, :]
-    scaled_intervention_vector_D = intervention_vector_D * scale
-    modified_model_activations_D = model_activations_D + scaled_intervention_vector_D
-    return modified_model_activations_D
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -226,12 +367,12 @@ def parse_args(args=None):
     parser.add_argument('--chunk_size', default=20000, type=int)
     parser.add_argument('--start_year', default=2013, type=int)
     parser.add_argument('--start_month', default=1, type=int)
-    parser.add_argument('--end_year', default=2019, type=int)
-    parser.add_argument('--end_month', default=12, type=int)
+    parser.add_argument('--end_year', default=2013, type=int)
+    parser.add_argument('--end_month', default=1, type=int)
     parser.add_argument('--from_checkpoint', default=False, type=bool)
     parser.add_argument('--checkpoint_year', default=2018, type=int)
     parser.add_argument('--checkpoint_month', default=12, type=int)
-    parser.add_argument('--test_year', default=2019, type=int)
+    parser.add_argument('--test_year', default=2023, type=int)
     parser.add_argument('--test_month', default=12, type=int)
     parser.add_argument('--num_cpu_left', default=4, type=int)
     parser.add_argument('--model', default='ViT', type=str)
@@ -254,7 +395,11 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
+    parser.add_argument('--sae_dim', default=2048, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
+    parser.add_argument('--sae_attention_heads', default=False, type=bool)
+    parser.add_argument('--sae_residual_streams', default=False, type=bool)
+    parser.add_argument('--sae_mlp_outputs', default=True, type=bool)
     return parser.parse_args(args)
 
 if __name__ == '__main__':
@@ -273,7 +418,7 @@ if __name__ == '__main__':
     trained_model_path = "weights.v2.pt"
     ckpt = torch.load(trained_model_path, map_location=torch.device('cuda:0'))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
-    model = torch.nn.DataParallel(model)
+    model = torch.nn.DataParallel(model, device_ids=[0])
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
@@ -286,7 +431,7 @@ if __name__ == '__main__':
     sae_state_dicts = {}
     for key, sae in trained_saes.items():
         sae_state_dicts[key] = sae.state_dict()
-    save_path = f'sae/trained_saes_{cfg.test_year}-{formatted_month}-new.pt'
+    save_path = f'sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-mlp.pt'
     torch.save(sae_state_dicts, save_path)
     print(f"Trained SAEs saved to {save_path}. Finished")
     

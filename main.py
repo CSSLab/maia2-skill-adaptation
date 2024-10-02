@@ -243,7 +243,7 @@ class MAIA2Dataset(torch.utils.data.Dataset):
         
         move_input = self.all_moves_dict[move_uci]
         
-        return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info, active_win, board_input
+        return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info, active_win, board
 
 class BasicBlock(torch.nn.Module):
 
