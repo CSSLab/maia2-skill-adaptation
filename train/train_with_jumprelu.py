@@ -32,23 +32,43 @@ class ActivationBuffer:
 
 class JumpReLU(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, threshold):
+    def forward(ctx, input, threshold, epsilon=0.001):
         ctx.save_for_backward(input, threshold)
+        ctx.epsilon = epsilon
         return input.clamp(min=threshold)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, threshold = ctx.saved_tensors
+        epsilon = ctx.epsilon
         grad_input = grad_output.clone()
         grad_input[input < threshold] = 0
 
-        # Simplified gradient estimation for threshold
         grad_threshold = torch.zeros_like(threshold)
-        mask = (input >= threshold) & (input < threshold + 0.1)
-        grad_threshold = -(grad_output * mask).sum(dim=0)
+        mask = (input >= threshold) & (input < threshold + epsilon)
+        grad_threshold = -(threshold / epsilon) * grad_output[mask].sum(dim=0)
 
-        return grad_input, grad_threshold
+        return grad_input, grad_threshold, None
 
+# straight-through estimator (STE) for approximating the derivative of heaviside function
+
+class CustomHeaviside(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, threshold, epsilon=0.001):
+        ctx.save_for_backward(input, threshold)
+        ctx.epsilon = epsilon
+        return (input >= threshold).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, threshold = ctx.saved_tensors
+        epsilon = ctx.epsilon
+        grad_input = torch.zeros_like(input)
+        mask = (input >= threshold) & (input < threshold + epsilon)
+        grad_input[mask] = -(1.0 / epsilon) * grad_output[mask]
+
+        return grad_input, None, None
+    
 class SparseAutoEncoder(nn.Module):
     def __init__(self, activation_dim: int, dict_size: int):
         super().__init__()
@@ -66,9 +86,10 @@ class SparseAutoEncoder(nn.Module):
             nn.init.zeros_(self.decoder_FD.bias)
 
         self.threshold = nn.Parameter(torch.rand(dict_size) * 0.1)
+        self.epsilon = 0.001  # You can make this a parameter if you want to tune it
 
     def encode(self, model_activations_D: torch.Tensor) -> torch.Tensor:
-        return JumpReLU.apply(self.encoder_DF(model_activations_D), self.threshold)
+        return JumpReLU.apply(self.encoder_DF(model_activations_D), self.threshold, self.epsilon)
     
     def decode(self, encoded_representation_F: torch.Tensor) -> torch.Tensor:
         return self.decoder_FD(encoded_representation_F)
@@ -86,7 +107,8 @@ def calculate_loss(autoencoder: SparseAutoEncoder, model_activations_BD: torch.T
     reconstruction_error_B = einops.reduce(reconstruction_error_BD, 'B D -> B', 'sum')
     l2_loss = reconstruction_error_B.mean()
 
-    l0_loss = l0_coefficient * torch.mean(torch.sigmoid(10 * (encoded_representation_BF - autoencoder.threshold)))
+    pre_activations = autoencoder.encoder_DF(model_activations_BD)
+    l0_loss = l0_coefficient * torch.mean(CustomHeaviside.apply(pre_activations, autoencoder.threshold.unsqueeze(0), autoencoder.epsilon))
     total_loss = l2_loss + l0_loss
     return total_loss, l2_loss, l0_loss
 
@@ -185,7 +207,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
     }
     
     _enable_activation_hook(model, cfg)
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     assert cfg.sae_attention_heads + cfg.sae_mlp_outputs + cfg.sae_residual_streams == 1
@@ -280,7 +302,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                             total_l2_losses[key] += l2_loss.item()
                             total_l0_losses[key] += l0_loss.item()
                             
-                            if total_sae_updates[key] % 1 == 0:
+                            if total_sae_updates[key] % 500 == 0:
                                 sae_state_dicts = {}
                                 for temp_key, sae in saes.items():
                                     sae_state_dicts[temp_key] = sae.state_dict()
@@ -388,7 +410,7 @@ def parse_args(args=None):
     # Tunable Arguments
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--wd', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=4096, type=int)
+    parser.add_argument('--batch_size', default=8192, type=int)
     parser.add_argument('--first_n_moves', default=10, type=int)
     parser.add_argument('--last_n_moves', default=10, type=int)
     parser.add_argument('--dim_cnn', default=256, type=int)
@@ -426,10 +448,10 @@ if __name__ == '__main__':
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
     trained_model_path = "maia2-sae/weights.v2.pt"
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(trained_model_path, map_location=torch.device(device))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
-    model = torch.nn.DataParallel(model, device_ids=[1])
+    model = torch.nn.DataParallel(model, device_ids=[0])
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
