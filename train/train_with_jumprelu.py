@@ -64,10 +64,15 @@ class CustomHeaviside(torch.autograd.Function):
         input, threshold = ctx.saved_tensors
         epsilon = ctx.epsilon
         grad_input = torch.zeros_like(input)
-        mask = (input >= threshold) & (input < threshold + epsilon)
-        grad_input[mask] = -(1.0 / epsilon) * grad_output[mask]
 
-        return grad_input, None, None
+        def K(z):
+            return (torch.abs(z) <= 0.5).float()
+
+        z = (input - threshold) / epsilon
+        kernel_vals = K(z)
+        grad_theta = -1.0 / epsilon * kernel_vals * grad_output
+
+        return grad_input, grad_theta, None
     
 class SparseAutoEncoder(nn.Module):
     def __init__(self, activation_dim: int, dict_size: int):
@@ -207,7 +212,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
     }
     
     _enable_activation_hook(model, cfg)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     assert cfg.sae_attention_heads + cfg.sae_mlp_outputs + cfg.sae_residual_streams == 1
@@ -388,7 +393,7 @@ def parse_args(args=None):
     # Supporting Arguments
     parser.add_argument('--data_root', default='maia2_sae/pgn', type=str)
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--num_workers', default=16, type=int)
+    parser.add_argument('--num_workers', default=32, type=int)
     parser.add_argument('--verbose', default=True, type=bool)
     parser.add_argument('--max_epochs', default=1, type=int)
     parser.add_argument('--max_ply', default=300, type=int)
@@ -424,7 +429,7 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
-    parser.add_argument('--sae_dim', default=2048, type=int)
+    parser.add_argument('--sae_dim', default=4096, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
     parser.add_argument('--l0_coefficient', default=0.00005, type=float)
     # parser.add_argument('--l1_coefficient', default=0.00005, type=float)
@@ -448,10 +453,10 @@ if __name__ == '__main__':
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
     trained_model_path = "maia2-sae/weights.v2.pt"
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(trained_model_path, map_location=torch.device(device))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
-    model = torch.nn.DataParallel(model, device_ids=[0])
+    model = torch.nn.DataParallel(model, device_ids=[1])
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
