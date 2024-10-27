@@ -6,6 +6,7 @@ from functools import partial
 from sklearn.metrics import precision_recall_fscore_support
 from .get_self_implemented_concepts import *
 import random
+import os
 
 def select_indices(lst, max_positive=250, max_negative=250):
     # Get the indices of positive and negative values
@@ -73,8 +74,42 @@ def cache_examples_and_activations_board_states(pieces, sae_activations, board_f
         samples_and_activations.append(temp)
     return samples_and_activations
 
+def plot_feature_histogram(feature_activations, ground_truth, concept_name, layer, auc):
+    layer_cnt = 6 if layer == 'transformer block 0 hidden states' else 7
+    feature_activations_np = feature_activations.numpy()
+    activations_0 = feature_activations_np[ground_truth == 0]
+    activations_1 = feature_activations_np[ground_truth == 1]
+
+    min_activation = np.min(feature_activations_np)
+    max_activation = np.max(feature_activations_np)
+    bins = np.linspace(min_activation, max_activation, 51) 
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(activations_0, bins=bins, alpha=0.5, label='Negative', color='blue', density=True)
+    plt.hist(activations_1, bins=bins, alpha=0.5, label='Positive', color='red', density=True)
+    
+    plt.xlabel('SAE Activation', fontsize=16)
+    plt.ylabel('Density', fontsize=16)
+    plt.title(f'{concept_name} CC-AUC={auc:.2f}', fontsize=18)
+    
+    plt.xticks(fontsize=14)
+    plt.yticks(fontsize=14)
+    plt.legend(fontsize=14)
+    
+    plt.grid(True, alpha=0.1)
+    plt.tight_layout()
+    
+    save_dir = f'maia2-sae/figs/sae_board_states_feature'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    plt.savefig(f'{save_dir}/{concept_name}-{layer}.pdf')
+    plt.close()
+
 def main() -> None:
-    with open('maia2_activations_for_sae.pickle', 'rb') as f:
+    test_dim = 16384
+    sae_lr = 5e-05
+    sae_site = "res"
+    with open(f'maia2-sae/activations/maia2_activations_for_sae_{test_dim}_{sae_lr}_{sae_site}.pickle', 'rb') as f:
         maia2_activations = pickle.load(f)
     target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']  # 'conv_last'
 
@@ -85,8 +120,7 @@ def main() -> None:
 
     pieces = ['P', 'N', 'B', 'R', 'Q', 'K', 'p', 'n', 'b', 'r', 'q', 'k']
 
-
-    samples_and_activations = cache_examples_and_activations(pieces, sae_activations, board_fens)
+    samples_and_activations = cache_examples_and_activations_board_states(pieces, sae_activations, board_fens)
 
     for j in range(len(pieces)):
         for square in range(64):
@@ -100,7 +134,7 @@ def main() -> None:
 
             for key in target_key_list:
                 print(f"Processing {key}")
-                sae_feature_activations = sae_activations[key][0]
+                sae_feature_activations = sae_activations[key]
                 n_features = sae_feature_activations.shape[1]
 
                 ground_truth = torch.cat((samples_and_activations[j][square]['positives'], samples_and_activations[j][square]['negatives']))
@@ -128,8 +162,8 @@ def main() -> None:
                 for i, (feature_index, threshold, precision, recall, f1) in enumerate(concept_results[:N], 1):
                     print(f"{i}. Feature {feature_index}: F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}")
 
-    with open('sae_feature_evaluation_results.pickle', 'wb') as f:
-        pickle.dump(results, f)
+    # with open('sae_feature_evaluation_results.pickle', 'wb') as f:
+    #     pickle.dump(results, f)
 
 
 if __name__ == "__main__":

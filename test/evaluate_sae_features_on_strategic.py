@@ -128,17 +128,20 @@ def plot_feature_histogram(feature_activations, ground_truth, concept_name, laye
     plt.grid(True, alpha=0.1)
     plt.tight_layout()
     
-    plt.savefig(f'figs/sae_strategic_feature/{concept_name}-{layer}.pdf')
+    save_dir = f'maia2-sae/figs/sae_strategic_feature'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    plt.savefig(f'{save_dir}/{concept_name}-{layer}.pdf')
     plt.close()
 
 def main() -> None:
-    test_dim = 2048
-    sae_lr = 1e-5
+    test_dim = 16384
+    sae_lr = 5e-05
     sae_site = "res"
-    with open(f'activations/maia2_activations_for_sae_{test_dim}_{sae_lr}_{sae_site}.pickle', 'rb') as f:
+    with open(f'maia2-sae/activations/maia2_activations_for_sae_{test_dim}_{sae_lr}_{sae_site}.pickle', 'rb') as f:
         maia2_activations = pickle.load(f)
-    target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states'] # 'transformer block 0 hidden states', 'conv_last'
 
+    target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states'] # 'transformer block 0 hidden states', 'conv_last'
     sae_activations = maia2_activations['all_sae_activations']
     board_fens = maia2_activations['board_fen']
     num_cores = min(72, cpu_count())
@@ -154,7 +157,7 @@ def main() -> None:
         results = {}
         for key in target_key_list:
             print(f"Processing {key}")
-            sae_feature_activations = sae_activations[key][0]
+            sae_feature_activations = sae_activations[key]
             n_features = sae_feature_activations.shape[1]
 
             sampled_sae_activations = samples_and_activations[concept_name][key]
