@@ -7,6 +7,7 @@ from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from .get_self_implemented_concepts import *
 import random
 import matplotlib.pyplot as plt
+import os
 
 def select_indices(lst, max_samples=500):
     positive_indices = [i for i, val in enumerate(lst) if val == 1]
@@ -29,19 +30,9 @@ def convert_indices(original_indices):
         larger_indices.extend(range(start_index, start_index + 8))
     return larger_indices
 
-def evaluate_sae_feature(feature_activations, ground_truth, threshold):
-    # Average the activations for each board (8 tokens per board)
-    feature_predictions = (feature_activations > threshold).int().cpu().numpy()
-    precision, recall, f1, _ = precision_recall_fscore_support(ground_truth, feature_predictions, average='macro', zero_division=0)
-    return precision, recall, f1
-
-# def evaluate_sae_feature(concept_func, feature_activations, board_fens, threshold):
-#     ground_truth = np.array([concept_func(fen) for fen in board_fens])
-    
+# def evaluate_sae_feature(feature_activations, ground_truth, threshold):
 #     # Average the activations for each board (8 tokens per board)
-#     feature_activations_avg = feature_activations.view(-1, 8).mean(dim=1)
-    
-#     feature_predictions = (feature_activations_avg > threshold).int().cpu().numpy()
+#     feature_predictions = (feature_activations > threshold).int().cpu().numpy()
 #     precision, recall, f1, _ = precision_recall_fscore_support(ground_truth, feature_predictions, average='macro', zero_division=0)
 #     return precision, recall, f1
 

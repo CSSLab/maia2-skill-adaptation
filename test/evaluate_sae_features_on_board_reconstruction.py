@@ -3,7 +3,7 @@ import torch
 import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support,  roc_auc_score
 from .get_self_implemented_concepts import *
 import random
 import os
@@ -31,29 +31,31 @@ def convert_indices(original_indices):
 
 def evaluate_sae_feature(ground_truth, feature_activations, threshold):
 
-    # Average the activations for each board (8 tokens per board)
-    feature_activations_avg = feature_activations.view(-1, 8).mean(dim=1)
+    # feature_activations_avg = feature_activations.view(-1, 8).mean(dim=1)
 
-    feature_predictions = (feature_activations_avg > threshold).int().cpu().numpy()
+    feature_predictions = (feature_activations > threshold).int().cpu().numpy()
     precision, recall, f1, _ = precision_recall_fscore_support(ground_truth, feature_predictions, average='macro',
                                                                zero_division=0)
     return precision, recall, f1
 
-
 def process_sae_feature(args):
     feature_index, feature_activations, ground_truth = args
     if torch.sum(feature_activations) == 0:
-        return feature_index, 0, 0, 0, 0
+        return feature_index, 0
+
+    feature_activations_np = feature_activations.numpy()
+    ground_truth_np = ground_truth.numpy()
+
+    if np.all(ground_truth_np == ground_truth_np[0]):
+        auc = 0.5
+
     else:
-        thresholds = torch.linspace(feature_activations.min(), 0.4 * feature_activations.max(), steps=4)
-        eval_func = partial(evaluate_sae_feature, ground_truth, feature_activations)
-        results = list(map(eval_func, thresholds))
+        # feature_activations = feature_activations.view(-1, 8).mean(dim=1)
+        feature_activations_np = feature_activations.numpy()
+        ground_truth_np = ground_truth.numpy()
+        auc = roc_auc_score(ground_truth_np, feature_activations_np)
 
-        best_threshold_index = max(range(len(results)), key=lambda i: results[i][-1])
-        best_precision, best_recall, best_f1 = results[best_threshold_index]
-        best_threshold = thresholds[best_threshold_index].item()
-        return feature_index, best_threshold, best_precision, best_recall, best_f1
-
+    return feature_index, auc
 
 def cache_examples_and_activations_board_states(pieces, sae_activations, board_fens):
     samples_and_activations = []
@@ -146,21 +148,23 @@ def main() -> None:
                     concept_results = list(tqdm.tqdm(pool.imap(process_sae_feature, args_list), total=n_features))
 
                 # Sort features by F1 score to calcuate the "coverage"
-                concept_results.sort(key=lambda x: x[4], reverse=True)
+                concept_results.sort(key=lambda x: x[-1], reverse=True)
                 results[concept_name] = concept_results
 
                 top_feature = concept_results[0]
                 print(f"\nBest feature for {concept_name}:")
                 print(f"Feature index: {top_feature[0]}")
-                print(f"Best threshold: {top_feature[1]:.4f}")
-                print(f"Precision: {top_feature[2]:.4f}")
-                print(f"Recall: {top_feature[3]:.4f}")
-                print(f"F1-score: {top_feature[4]:.4f}")
+                # print(f"Best threshold: {top_feature[1]:.4f}")
+                # print(f"Precision: {top_feature[2]:.4f}")
+                # print(f"Recall: {top_feature[3]:.4f}")
+                print(f"AUC: {top_feature[1]:.4f}")
+
+                plot_feature_histogram(sampled_sae_activations[:, top_feature[0]], ground_truth, concept_name, key, top_feature[1])
 
                 N = 5
                 print(f"\nTop {N} features for {concept_name}:")
-                for i, (feature_index, threshold, precision, recall, f1) in enumerate(concept_results[:N], 1):
-                    print(f"{i}. Feature {feature_index}: F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}")
+                for i, (feature_index, auc) in enumerate(concept_results[:N], 1):
+                    print(f"{i}. Feature {feature_index}: AUC={auc:.4f}")
 
     # with open('sae_feature_evaluation_results.pickle', 'wb') as f:
     #     pickle.dump(results, f)

@@ -31,48 +31,36 @@ class ActivationBuffer:
 # JumpRelu SAE
 
 class JumpReLU(torch.autograd.Function):
+    """
+    JumpReLU activation with correct gradient estimation as per DM paper:
+    - Forward: Hard threshold at theta
+    - Backward: Uses kernel density estimation for gradients
+    """
     @staticmethod
     def forward(ctx, input, threshold, epsilon=0.001):
         ctx.save_for_backward(input, threshold)
         ctx.epsilon = epsilon
-        return input.clamp(min=threshold)
-
+        return input * (input >= threshold)  # z * H(z - theta)
+    
     @staticmethod
     def backward(ctx, grad_output):
         input, threshold = ctx.saved_tensors
         epsilon = ctx.epsilon
         grad_input = grad_output.clone()
-        grad_input[input < threshold] = 0
-
-        grad_threshold = torch.zeros_like(threshold)
-        mask = (input >= threshold) & (input < threshold + epsilon)
-        grad_threshold = -(threshold / epsilon) * grad_output[mask].sum(dim=0)
-
+        
+        # Standard gradient for input when above threshold
+        grad_input = torch.where(input >= threshold, grad_output, torch.zeros_like(grad_input))
+        
+        # Gradient for threshold from reconstruction loss (JumpReLU part)
+        # ∂JumpReLU(z)/∂θ := -(θ/ε)K((z-θ)/ε)
+        z_centered = (input - threshold) / epsilon
+        kernel_vals = (torch.abs(z_centered) <= 0.5).float()  # rectangle kernel
+        grad_threshold_recon = -(threshold / epsilon) * kernel_vals * grad_output
+        
+        # final gradient for threshold parameter
+        grad_threshold = grad_threshold_recon.sum(dim=0)
+        
         return grad_input, grad_threshold, None
-
-# straight-through estimator (STE) for approximating the derivative of heaviside function
-
-class CustomHeaviside(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, threshold, epsilon=0.001):
-        ctx.save_for_backward(input, threshold)
-        ctx.epsilon = epsilon
-        return (input >= threshold).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, threshold = ctx.saved_tensors
-        epsilon = ctx.epsilon
-        grad_input = torch.zeros_like(input)
-
-        def K(z):
-            return (torch.abs(z) <= 0.5).float()
-
-        z = (input - threshold) / epsilon
-        kernel_vals = K(z)
-        grad_theta = -1.0 / epsilon * kernel_vals * grad_output
-
-        return grad_input, grad_theta, None
     
 class SparseAutoEncoder(nn.Module):
     def __init__(self, activation_dim: int, dict_size: int):
@@ -80,47 +68,68 @@ class SparseAutoEncoder(nn.Module):
         self.activation_dim = activation_dim
         self.dict_size = dict_size
 
+        # Initialize encoder and decoder
         self.encoder_DF = nn.Linear(activation_dim, dict_size, bias=True)
         self.decoder_FD = nn.Linear(dict_size, activation_dim, bias=True)
+        
+        # Initialize weights
         nn.init.kaiming_normal_(self.encoder_DF.weight, nonlinearity='relu')
         nn.init.kaiming_normal_(self.decoder_FD.weight, nonlinearity='relu')
+        nn.init.zeros_(self.encoder_DF.bias)
+        nn.init.zeros_(self.decoder_FD.bias)
 
-        if self.encoder_DF.bias is not None:
-            nn.init.zeros_(self.encoder_DF.bias)
-        if self.decoder_FD.bias is not None:
-            nn.init.zeros_(self.decoder_FD.bias)
-
-        self.threshold = nn.Parameter(torch.rand(dict_size) * 0.1)
-        self.epsilon = 0.001  # You can make this a parameter if you want to tune it
-
-    def encode(self, model_activations_D: torch.Tensor) -> torch.Tensor:
-        return JumpReLU.apply(self.encoder_DF(model_activations_D), self.threshold, self.epsilon)
+        self.threshold = nn.Parameter(torch.ones(dict_size) * 0.5)
+        self.epsilon = 0.001  # KDE bandwidth parameter
+        
+    def encode(self, model_activations: torch.Tensor) -> torch.Tensor:
+        return JumpReLU.apply(self.encoder_DF(model_activations), self.threshold, self.epsilon)
     
-    def decode(self, encoded_representation_F: torch.Tensor) -> torch.Tensor:
-        return self.decoder_FD(encoded_representation_F)
+    def decode(self, encoded_activations: torch.Tensor) -> torch.Tensor:
+        return self.decoder_FD(encoded_activations)
     
-    def forward_pass(self, model_activations_D: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded_representation_F = self.encode(model_activations_D)
-        reconstructed_model_activations_D = self.decode(encoded_representation_F)
-        return reconstructed_model_activations_D, encoded_representation_F
+    def forward_pass(self, model_activations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.encode(model_activations)
+        reconstructed = self.decode(encoded)
+        return reconstructed, encoded
 
-# B = batch size, D = d_model, F = dictionary_size
+def calculate_loss(sae: nn.Module, model_activations: torch.Tensor, l0_coefficient: float, epsilon=0.001):
+    """
+    Compute total loss including:
+    1. Reconstruction loss using JumpReLU activation
+    2. L0 sparsity loss using Heaviside with gradient estimator illustrated in the papere
+    """
 
-def calculate_loss(autoencoder: SparseAutoEncoder, model_activations_BD: torch.Tensor, l0_coefficient: float):
-    reconstructed_model_activations_BD, encoded_representation_BF = autoencoder.forward_pass(model_activations_BD)
-    reconstruction_error_BD = (reconstructed_model_activations_BD - model_activations_BD).pow(2)
-    reconstruction_error_B = einops.reduce(reconstruction_error_BD, 'B D -> B', 'sum')
-    l2_loss = reconstruction_error_B.mean()
+    reconstructed_activations, encoded = sae.forward_pass(model_activations)
+    reconstruction_loss = (reconstructed_activations - model_activations).pow(2).mean()
+    
+    # L0 sparsity loss with gradient estimator for threshold
+    pre_activations = sae.encoder_DF(model_activations)
+    threshold = sae.threshold
 
-    pre_activations = autoencoder.encoder_DF(model_activations_BD)
-    l0_loss = l0_coefficient * torch.mean(CustomHeaviside.apply(pre_activations, autoencoder.threshold.unsqueeze(0), autoencoder.epsilon))
-    total_loss = l2_loss + l0_loss
-    return total_loss, l2_loss, l0_loss
+    z_centered = (pre_activations - threshold.unsqueeze(0)) / epsilon
+    kernel_vals = (torch.abs(z_centered) <= 0.5).float() 
+
+    def backward_hook(grad):
+        # ∂H(z-θ)/∂θ := -(1/ε)K((z-θ)/ε)
+        return -(1.0 / epsilon) * kernel_vals * grad
+    
+    heaviside = (pre_activations >= threshold.unsqueeze(0)).float()
+    heaviside = heaviside.detach().requires_grad_()
+    heaviside.register_hook(backward_hook)
+    l0_loss = l0_coefficient * heaviside.mean()
+    
+    total_loss = reconstruction_loss + l0_loss
+    return total_loss, reconstruction_loss, l0_loss
 
 def train_sae(sae, optimizer, activations, l0_coefficient):
     optimizer.zero_grad()
     total_loss, l2_loss, l0_loss = calculate_loss(sae, activations, l0_coefficient)
     total_loss.backward()
+
+    # Ensure threshold stays positive
+    with torch.no_grad():
+        sae.threshold.clamp_(min=1e-6)
+
     optimizer.step()
     return total_loss, l2_loss, l0_loss
 
@@ -212,7 +221,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
     }
     
     _enable_activation_hook(model, cfg)
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     assert cfg.sae_attention_heads + cfg.sae_mlp_outputs + cfg.sae_residual_streams == 1
@@ -344,11 +353,11 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                     sae_state_dicts[tmp_key] = sae.state_dict()
 
                                 if cfg.sae_attention_heads:    
-                                    save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att-temp.pt'
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att-temp.pt'
                                 if cfg.sae_residual_streams:
-                                    save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res-temp.pt'
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res-temp.pt'
                                 if cfg.sae_mlp_outputs:
-                                    save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp-temp.pt'
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp-temp.pt'
                                 torch.save(sae_state_dicts, save_path)
                 
                 for site in ['attention_heads', 'mlp_outputs', 'residual_streams']:
@@ -393,7 +402,7 @@ def parse_args(args=None):
     # Supporting Arguments
     parser.add_argument('--data_root', default='maia2_sae/pgn', type=str)
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--num_workers', default=32, type=int)
+    parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--verbose', default=True, type=bool)
     parser.add_argument('--max_epochs', default=1, type=int)
     parser.add_argument('--max_ply', default=300, type=int)
@@ -429,9 +438,9 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
-    parser.add_argument('--sae_dim', default=4096, type=int)
+    parser.add_argument('--sae_dim', default=16384, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
-    parser.add_argument('--l0_coefficient', default=0.00005, type=float)
+    parser.add_argument('--l0_coefficient', default=0.001, type=float)
     # parser.add_argument('--l1_coefficient', default=0.00005, type=float)
     parser.add_argument('--sae_attention_heads', default=False, type=bool)
     parser.add_argument('--sae_residual_streams', default=True, type=bool)
@@ -453,10 +462,10 @@ if __name__ == '__main__':
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
     trained_model_path = "maia2-sae/weights.v2.pt"
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(trained_model_path, map_location=torch.device(device))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
-    model = torch.nn.DataParallel(model, device_ids=[1])
+    model = torch.nn.DataParallel(model, device_ids=[0])
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
 
@@ -507,11 +516,11 @@ if __name__ == '__main__':
         sae_state_dicts[key] = sae.state_dict()
 
     if cfg.sae_attention_heads:    
-        save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att.pt'
+        save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att.pt'
     if cfg.sae_residual_streams:
-        save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
+        save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
     if cfg.sae_mlp_outputs:
-        save_path = f'maia2-sae/sae/trained_saes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp.pt'
+        save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp.pt'
     torch.save(sae_state_dicts, save_path)
     print(f"Trained SAEs saved to {save_path}. Finished")
     
