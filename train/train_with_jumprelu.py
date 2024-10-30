@@ -244,6 +244,19 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
     total_l2_losses = {key: 0.0 for key in target_key_list}
     total_l0_losses = {key: 0.0 for key in target_key_list}
 
+    loss_history = {key: {
+        'total_loss': [],
+        'l2_loss': [],
+        'l0_loss': [],
+        'step': []
+    } for key in target_key_list}
+
+    auc_history = {key: {
+        'str_auc': [],
+        'brd_auc': [],
+        'step': []
+    } for key in target_key_list}
+
     # Initialize variables for calibration and early stopping
     best_auc_sum = {key: 0 for key in target_key_list}
     patience = 5
@@ -315,8 +328,13 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                             total_losses[key] += total_loss.item()
                             total_l2_losses[key] += l2_loss.item()
                             total_l0_losses[key] += l0_loss.item()
+
+                            loss_history[key]['total_loss'].append(total_loss.item())
+                            loss_history[key]['l2_loss'].append(l2_loss.item())
+                            loss_history[key]['l0_loss'].append(l0_loss.item())
+                            loss_history[key]['step'].append(total_sae_updates[key])
                             
-                            if total_sae_updates[key] % 500 == 0:
+                            if total_sae_updates[key] % 100 == 0:
                                 sae_state_dicts = {}
                                 for temp_key, sae in saes.items():
                                     sae_state_dicts[temp_key] = sae.state_dict()
@@ -324,6 +342,10 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                 str_res, str_auc = evaluate_sae_features_in_train_strategic(split_activations, sae_state_dicts, key, board_input, concept_functions)
                                 brd_res, brd_auc = evaluate_sae_features_in_train_board_state(split_activations, sae_state_dicts, key, board_input)
                                 
+                                auc_history[key]['str_auc'].append(str_auc)
+                                auc_history[key]['brd_auc'].append(brd_auc)
+                                auc_history[key]['step'].append(total_sae_updates[key])
+
                                 avg_total_loss = total_losses[key] / total_sae_updates[key]
                                 avg_l2_loss = total_l2_losses[key] / total_sae_updates[key]
                                 avg_l0_loss = total_l0_losses[key] / total_sae_updates[key]
@@ -333,6 +355,37 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                     f"Avg Total Loss: {avg_total_loss:.4f}, "
                                     f"Avg L2 Loss: {avg_l2_loss:.4f}, "
                                     f"Avg L0 Loss: {avg_l0_loss:.4f}")
+
+                                checkpoint = {
+                                    'sae_state_dicts': sae_state_dicts,
+                                    'loss_history': {
+                                        k: {
+                                            'total_loss': loss_history[k]['total_loss'],
+                                            'l2_loss': loss_history[k]['l2_loss'],
+                                            'l0_loss': loss_history[k]['l0_loss'],
+                                            'step': loss_history[k]['step']
+                                        } for k in target_key_list
+                                    },
+                                    'auc_history': {
+                                        k: {
+                                            'str_auc': auc_history[k]['str_auc'],
+                                            'brd_auc': auc_history[k]['brd_auc'],
+                                            'step': auc_history[key]['step']
+                                        } for k in target_key_list
+                                    }
+                                }
+
+                                # sae_state_dicts = {}
+                                # for tmp_key, sae in saes.items():
+                                #     sae_state_dicts[tmp_key] = sae.state_dict()
+
+                                if cfg.sae_attention_heads:    
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att-temp.pt'
+                                if cfg.sae_residual_streams:
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res-temp.pt'
+                                if cfg.sae_mlp_outputs:
+                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp-temp.pt'
+                                torch.save(checkpoint, save_path)
 
                                 current_auc_sum = str_auc + brd_auc
                                 if current_auc_sum > best_auc_sum[key]:
@@ -347,18 +400,6 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                         print("Early stopping condition met for all layers. Stopping training.")
                                         early_stop = True
                                         break
-
-                                sae_state_dicts = {}
-                                for tmp_key, sae in saes.items():
-                                    sae_state_dicts[tmp_key] = sae.state_dict()
-
-                                if cfg.sae_attention_heads:    
-                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att-temp.pt'
-                                if cfg.sae_residual_streams:
-                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res-temp.pt'
-                                if cfg.sae_mlp_outputs:
-                                    save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp-temp.pt'
-                                torch.save(sae_state_dicts, save_path)
                 
                 for site in ['attention_heads', 'mlp_outputs', 'residual_streams']:
                     if hasattr(_thread_local, site):
@@ -388,6 +429,18 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
         if early_stop:
             break
     
+    final_checkpoint = {
+        'sae_state_dicts': {key: sae.state_dict() for key, sae in saes.items()},
+        'loss_history': loss_history,
+        'total_sae_updates': total_sae_updates,
+        'training_time': time.time() - start_time,
+        'epochs_completed': epoch + 1
+    }
+
+    prefix = 'att' if cfg.sae_attention_heads else ('res' if cfg.sae_residual_streams else 'mlp')
+    final_save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-{prefix}.pt'
+    torch.save(final_checkpoint, final_save_path)
+
     total_time = time.time() - start_time
     print(f"\nSAE training completed in {total_time:.2f}s")
     for key in target_key_list:
@@ -438,9 +491,9 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
-    parser.add_argument('--sae_dim', default=16384, type=int)
+    parser.add_argument('--sae_dim', default=2048, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
-    parser.add_argument('--l0_coefficient', default=0.001, type=float)
+    parser.add_argument('--l0_coefficient', default=0.1, type=float)
     # parser.add_argument('--l1_coefficient', default=0.00005, type=float)
     parser.add_argument('--sae_attention_heads', default=False, type=bool)
     parser.add_argument('--sae_residual_streams', default=True, type=bool)

@@ -111,10 +111,16 @@ def evaluate_sae_features_in_train_strategic(split_activations, sae, key, board_
     sae_weight = sae[key]['encoder_DF.weight'].to(device)
     sae_bias = sae[key]['encoder_DF.bias'].to(device)
 
-    encoded = nn.functional.linear(split_activations, sae_weight, sae_bias)
-    encoded = nn.functional.relu(encoded)
-    activations = {}
-    activations[key] = encoded
+    pre_activations = nn.functional.linear(split_activations, sae_weight, sae_bias)
+    
+    # Check if using JumpReLU
+    if 'threshold' in sae[key]:
+        thresholds = sae[key]['threshold'].to(device)
+        encoded = pre_activations * (pre_activations >= thresholds.unsqueeze(0))
+    else:
+        encoded = nn.functional.relu(pre_activations)
+
+    activations = {key: encoded}
     num_cores = min(72, cpu_count())
     n_features = encoded.shape[1]
     results = {}
@@ -151,10 +157,16 @@ def evaluate_sae_features_in_train_board_state(split_activations, sae, key, boar
     sae_weight = sae[key]['encoder_DF.weight'].to(device)
     sae_bias = sae[key]['encoder_DF.bias'].to(device)
 
-    encoded = nn.functional.linear(split_activations, sae_weight, sae_bias)
-    encoded = nn.functional.relu(encoded)
-    activations = {}
-    activations[key] = encoded
+    pre_activations = nn.functional.linear(split_activations, sae_weight, sae_bias)
+    
+    # Check if using JumpReLU
+    if 'threshold' in sae[key]:
+        thresholds = sae[key]['threshold'].to(device)
+        encoded = pre_activations * (pre_activations >= thresholds.unsqueeze(0))
+    else:
+        encoded = nn.functional.relu(pre_activations)
+
+    activations = {key: encoded}
     num_cores = min(72, cpu_count())
     n_features = encoded.shape[1]
     results = {}

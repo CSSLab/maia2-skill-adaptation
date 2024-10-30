@@ -76,9 +76,14 @@ def apply_sae_to_activations(sae, activations, target_key_list):
     for key in target_key_list:
         if key in activations and key in sae:
             act = torch.mean(activations[key], dim=1)
-            # print(act.shape)
-            encoded = nn.functional.linear(act, sae[key]['encoder_DF.weight'], sae[key]['encoder_DF.bias'])
-            encoded = nn.functional.relu(encoded)
+            pre_activation = nn.functional.linear(act, sae[key]['encoder_DF.weight'], sae[key]['encoder_DF.bias'])
+
+            if 'threshold' in sae[key]:
+                thresholds = sae[key]['threshold']
+                encoded = pre_activation * (pre_activation >= thresholds.unsqueeze(0))
+            else:
+                encoded = nn.functional.relu(pre_activation)
+                
             sae_activations[key] = encoded
     
     return sae_activations
@@ -146,7 +151,7 @@ def parse_args(args=None):
     parser.add_argument('--input_channels', default=18, type=int)
     parser.add_argument('--vit_length', default=8, type=int)
     parser.add_argument('--elo_dim', default=128, type=int)
-    parser.add_argument('--sae_dim', default=16384, type=int)
+    parser.add_argument('--sae_dim', default=2048, type=int)
     
     return parser.parse_args(args)
 
@@ -184,10 +189,10 @@ def main():
                               num_workers=args.num_workers)
         break
 
-    sae_lr = 5e-05
+    sae_lr = 0.1
     sae_site = "res"
-    sae_date = "2023-09"
-    sae = torch.load(f'maia2-sae/sae/trained_saes_{sae_date}-{args.sae_dim}-{sae_lr}-{sae_site}-temp.pt')
+    sae_date = "2023-10"
+    sae = torch.load(f'maia2-sae/sae/trained_jrsaes_{sae_date}-{args.sae_dim}-{sae_lr}-{sae_site}-temp.pt')
         
     threadlocal = enable_activation_hook(model, args)
     
