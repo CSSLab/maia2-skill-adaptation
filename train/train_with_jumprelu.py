@@ -259,7 +259,17 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
 
     # Initialize variables for calibration and early stopping
     best_auc_sum = {key: 0 for key in target_key_list}
-    patience = 5
+    best_model_state_dicts = {key: None for key in target_key_list}
+    best_model_metrics = {
+        key: {
+            'str_auc': 0,
+            'brd_auc': 0,
+            'total_auc': 0,
+            'step': 0,
+            'epoch': 0
+        } for key in target_key_list
+    }
+    patience = 50
     patience_counter = {key: 0 for key in target_key_list}
     early_stop = False
     
@@ -390,6 +400,45 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                 current_auc_sum = str_auc + brd_auc
                                 if current_auc_sum > best_auc_sum[key]:
                                     best_auc_sum[key] = current_auc_sum
+                                    best_model_state_dicts = {k: v.state_dict() for k, v in saes.items()}  # Save all SAEs state
+                                    best_model_metrics[key] = {
+                                        'str_auc': str_auc,
+                                        'brd_auc': brd_auc,
+                                        'total_auc': current_auc_sum,
+                                        'step': total_sae_updates[key],
+                                        'epoch': epoch
+                                    }
+                                    
+                                    best_checkpoint = {
+                                        'sae_state_dicts': best_model_state_dicts,  # Consistent with regular save format
+                                        'loss_history': {
+                                            k: {
+                                                'total_loss': loss_history[k]['total_loss'],
+                                                'l2_loss': loss_history[k]['l2_loss'],
+                                                'l0_loss': loss_history[k]['l0_loss'],
+                                                'step': loss_history[k]['step']
+                                            } for k in target_key_list
+                                        },
+                                        'auc_history': {
+                                            k: {
+                                                'str_auc': auc_history[k]['str_auc'],
+                                                'brd_auc': auc_history[k]['brd_auc'],
+                                                'step': auc_history[k]['step']
+                                            } for k in target_key_list
+                                        },
+                                        'best_metrics': best_model_metrics
+                                    }
+                                    
+                                    if cfg.sae_attention_heads:    
+                                        best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att.pt'
+                                    if cfg.sae_residual_streams:
+                                        best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
+                                    if cfg.sae_mlp_outputs:
+                                        best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp.pt'
+                                    
+                                    torch.save(best_checkpoint, best_save_path)
+                                    print(f"New best model saved with AUC sum: {current_auc_sum:.4f} (STR: {str_auc:.4f}, BRD: {brd_auc:.4f})")
+                                    
                                     patience_counter[key] = 0
                                 else:
                                     patience_counter[key] += 1
@@ -462,7 +511,7 @@ def parse_args(args=None):
     parser.add_argument('--clock_threshold', default=30, type=int)
     parser.add_argument('--chunk_size', default=20000, type=int)
     parser.add_argument('--start_year', default=2023, type=int)
-    parser.add_argument('--start_month', default=10, type=int)
+    parser.add_argument('--start_month', default=11, type=int)
     parser.add_argument('--end_year', default=2023, type=int)
     parser.add_argument('--end_month', default=11, type=int)
     parser.add_argument('--from_checkpoint', default=False, type=bool)
@@ -491,9 +540,9 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
-    parser.add_argument('--sae_dim', default=2048, type=int)
+    parser.add_argument('--sae_dim', default=8192, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
-    parser.add_argument('--l0_coefficient', default=0.1, type=float)
+    parser.add_argument('--l0_coefficient', default=1, type=float)
     # parser.add_argument('--l1_coefficient', default=0.00005, type=float)
     parser.add_argument('--sae_attention_heads', default=False, type=bool)
     parser.add_argument('--sae_residual_streams', default=True, type=bool)
