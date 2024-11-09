@@ -9,7 +9,7 @@ from tqdm import tqdm
 import random
 import threading
 import json
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import logging
@@ -543,7 +543,7 @@ def find_best_intervention(original_results_dict, intervened_results_dict, elo_r
         best_accuracies[square] = {}
         original_accuracies[square] = {}
         
-        for elo in range(elo_range):
+        for elo in elo_range:
             best_acc = None
             original_acc = None
             
@@ -563,7 +563,6 @@ def find_best_intervention(original_results_dict, intervened_results_dict, elo_r
             if original_acc is not None:
                 original_accuracies[square][elo] = original_acc
     return original_accuracies, best_accuracies
-
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -638,16 +637,28 @@ def main() -> None:
     all_best_transitional_moves = []
     transitional_maia_moves = []
 
-    dataset_dir = 'maia2-sae/dataset/maia2_trans_mono_dataset'
-    file_pattern = os.path.join(dataset_dir, 'lichess_db_eval_chunk_*.jsonl')
-    file_list = glob.glob(file_pattern)
+    # dataset_dir = 'maia2-sae/dataset/maia2_trans_mono_dataset'
+    # file_pattern = os.path.join(dataset_dir, 'lichess_db_eval_chunk_*.jsonl')
+    # file_list = glob.glob(file_pattern)
 
-    for file_path in tqdm(file_list, desc="Processing Maia-2 trans-mono data"):
-        special_fens, counters, transition_points, best_transitional_moves, transitional_maia_moves = process_positions(
-            file_path, special_fens, best_transitional_moves, all_best_transitional_moves, transitional_maia_moves,
-            counters, transition_points)
+    # for file_path in tqdm(file_list, desc="Processing Maia-2 trans-mono data"):
+    #     special_fens, counters, transition_points, best_transitional_moves, transitional_maia_moves = process_positions(
+    #         file_path, special_fens, best_transitional_moves, all_best_transitional_moves, transitional_maia_moves,
+    #         counters, transition_points)
         
-    # print(transitional_maia_moves[0])
+    tot_dataset_cnt = 10
+    for i in tqdm(range(tot_dataset_cnt), desc="Processing Maia-2 trans-mono data"):
+        file_path = f'/grace/cache/huggingface/lichess_data/lichess_db_evals_with_maia2/lichess_db_eval_chunk_{i}.jsonl'
+        special_fens, counters, transition_points, best_transitional_moves, transitional_maia_moves = process_positions(
+            file_path, 
+            special_fens, 
+            best_transitional_moves, 
+            all_best_transitional_moves, 
+            transitional_maia_moves,
+            counters, 
+            transition_points
+        )
+
     total_non_all_correct = counters['total'] - counters['all_correct']
     print("Total positions:", counters['total'])
     print("Monotonic positions:", counters['monotonic'], f"({counters['monotonic'] / counters['total']:.2%})")
@@ -674,14 +685,26 @@ def main() -> None:
         with open(f'{intervention_data_dir}/blunder_list.json', 'w') as f:
             json.dump(blunder_list, f)
 
-    squarewise_alarmbells = {'a1': (700, 0.36075833439826965), 'b1': (700, 0.34046846628189087), 'c1': (1835, 0.21228957176208496), 'd1': (700, 0.26641276478767395), 'f1': (656, 0.38744181394577026), 'g1': (120, 1.372929573059082), 'h1': (1224, 0.35428425669670105), 'a2': (1662, 0.2485594004392624), 'b2': (1785, 0.14544463157653809), 'c2': (757, 0.2955701947212219), 'd2': (1879, 0.2876772880554199), 'e2': (1579, 0.09466977417469025), 'g2': (1453, 0.534953236579895), 'h2': (1495, 0.4493197202682495), 'a3': (416, 0.18684718012809753), 'c3': (1333, 0.3227689862251282), 'd3': (717, 0.39051148295402527), 'f3': (1308, 0.4294995367527008), 'h3': (1883, 0.1986609697341919), 'a4': (1637, 0.5537023544311523), 'b4': (1, 1.2216111421585083), 'c4': (1978, 0.3465708792209625), 'd4': (1789, 0.24516381323337555), 'e4': (603, 0.4142204821109772), 'f4': (1158, 0.20746734738349915), 'h4': (472, 0.3967437446117401), 'b5': (882, 0.4750314950942993), 'c5': (587, 0.145487979054451), 'd5': (1208, 0.28872203826904297), 'e5': (170, 0.04572858288884163), 'g5': (147, 0.09553366154432297), 'h5': (472, 1.1114749908447266), 'c6': (574, 1.6026335954666138), 'e6': (1481, 1.1328874826431274), 'b7': (455, 0.40555328130722046)}
-    target_key_list = ['transformer block 1 hidden states']
+    with open('maia2-sae/dataset/intervention/layer7_squarewise_features.pickle', 'rb') as f:
+        layer7_features = pickle.load(f)
+
+    # Mediated intervention on the last transformer block hidden states
+    target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
+    squarewise_alarmbells = {}
+    for concept_name, feature_results in layer7_features.items():
+        square = concept_name[-2:]  
+        best_feature = feature_results[0]  
+        feature_idx, auc_score = best_feature
+        squarewise_alarmbells[square] = (feature_idx, auc_score)
+
+    print(squarewise_alarmbells)
+
     all_ground_truths = []
     intervention_site = []
 
     for key, value in squarewise_alarmbells.items():
-        layer, feature_idx = target_key_list[0], value[0]
-        intervention_site.append((target_key_list[0], feature_idx))
+        layer, feature_idx = target_key_list[1], value[0]
+        intervention_site.append((layer, feature_idx))
         ground_truth = []
         for i in tqdm(range(len(special_fens['transitional']))):
             fen = special_fens['transitional'][i]
@@ -730,13 +753,11 @@ def main() -> None:
     with open(output_path, 'w') as json_file:
         json.dump(filtered_data, json_file)
 
-    sae_dim = 2048
-    sae_lr = 1e-05
+    sae_dim = 8192
+    sae_lr = 1
     sae_site = "res"
-    sae_date = "2023-12"
-    sae = torch.load(f'maia2_sae/sae/trained_saes_{sae_date}-{sae_dim}-{sae_lr}-{sae_site}.pt')
-    target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
-
+    sae_date = "2023-11"
+    sae = torch.load(f'maia2-sae/sae/best_jrsaes_{sae_date}-{sae_dim}-{sae_lr}-{sae_site}.pt')['sae_state_dicts']
 
     layer_one_features = squarewise_alarmbells.copy()
     elo_range = range(len(elo_dict) - 1) # excluding top level because all the time it predicts correctly in transitional positions
@@ -746,7 +767,36 @@ def main() -> None:
         original_results_dict, intervened_results_dict, transition_points_deviation = mediated_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict)
         # For further visualization use
         original_acc, best_intervened_acc = find_best_intervention(original_results_dict, intervened_results_dict, elo_range)
-    
+
+        avg_best_accuracies = {}
+        avg_original_accuracies = {}
+
+        for elo in elo_range:
+            best_acc_sum = sum(square_acc[elo] for square_acc in best_intervened_acc.values() if elo in square_acc)
+            best_acc_count = sum(1 for square_acc in best_intervened_acc.values() if elo in square_acc)
+            
+            original_acc_sum = sum(square_acc[elo] for square_acc in original_acc.values() if elo in square_acc)
+            original_acc_count = sum(1 for square_acc in original_acc.values() if elo in square_acc)
+            
+            if best_acc_count > 0:
+                avg_best_accuracies[elo] = best_acc_sum / best_acc_count
+            
+            if original_acc_count > 0:
+                avg_original_accuracies[elo] = original_acc_sum / original_acc_count
+
+        print(avg_best_accuracies, avg_original_accuracies)
+
+        save_dir='maia2-sae/dataset/intervention'
+        results = {
+            'best_accuracies': avg_best_accuracies,
+            'original_accuracies': avg_original_accuracies
+        }
+        
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'vanilla_intervention_accuracies.pickle')
+        with open(save_path, 'wb') as f:
+            pickle.dump(results, f)
+
     if cfg.intervention == 'random':
         original_results_dict, random_results_dict = random_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict)
         # For random tests; it's not the final version of random test
@@ -755,6 +805,10 @@ def main() -> None:
     if cfg.intervention == 'patching':
         # TODO later
         pass
+
+
+
+
 
 if __name__=="__main__":
     main()

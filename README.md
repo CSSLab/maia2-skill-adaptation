@@ -8,6 +8,12 @@ The training process supports the choice of SAE hyperparameters and hook sites t
 python -m maia2-sae.train.train [arguments]
 ```
 
+or for training SAEs with JumpRelu activations:
+
+```bash
+python -m maia2-sae.train.train_with_jumprelu [arguments]
+```
+
 Key Arguments for SAE Training
 The following arguments control the SAE training process:
 

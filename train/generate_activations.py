@@ -10,6 +10,8 @@ import argparse
 from ..maia2.main import *
 from ..maia2.utils import get_all_possible_moves, create_elo_dict
 
+_thread_local = threading.local()
+
 def get_chunks(pgn_path, chunk_size):
     chunk_count = 0
     chunks = []
@@ -74,59 +76,56 @@ class MAIA2Dataset(torch.utils.data.Dataset):
 def apply_sae_to_activations(sae, activations, target_key_list):
     sae_activations = {}
     for key in target_key_list:
-        if key in activations and key in sae:
-            act = torch.mean(activations[key], dim=1)
-            pre_activation = nn.functional.linear(act, sae[key]['encoder_DF.weight'], sae[key]['encoder_DF.bias'])
+        act = torch.mean(activations[key], dim=1)
+        pre_activation = nn.functional.linear(act, sae[key]['encoder_DF.weight'], sae[key]['encoder_DF.bias'])
 
-            if 'threshold' in sae[key]:
-                thresholds = sae[key]['threshold']
-                encoded = pre_activation * (pre_activation >= thresholds.unsqueeze(0))
-            else:
-                encoded = nn.functional.relu(pre_activation)
-                
-            sae_activations[key] = encoded
+        if 'threshold' in sae[key]:
+            thresholds = sae[key]['threshold']
+            encoded = pre_activation * (pre_activation >= thresholds.unsqueeze(0))
+        else:
+            encoded = nn.functional.relu(pre_activation)
+            
+        sae_activations[key] = encoded
     
     return sae_activations
 
-def enable_activation_hook(model, cfg):
-    threadlocal = threading.local()
-    
+def _enable_activation_hook(model, cfg):
     def get_activation(name):
         def hook(model, input, output):
-            if not hasattr(threadlocal, 'residual_streams'):
-                threadlocal.residual_streams = {}
-            threadlocal.residual_streams[name] = output.detach()
+            if not hasattr(_thread_local, 'residual_streams'):
+                _thread_local.residual_streams = {}
+            _thread_local.residual_streams[name] = output.detach()
         return hook
-    
+        
     def get_attention_head(name):
         def hook(module, input, output):
-            if not hasattr(threadlocal, 'attention_heads'):
-                threadlocal.attention_heads = {}
+            if not hasattr(_thread_local, 'attention_heads'):
+                _thread_local.attention_heads = {}
             batch_size, seq_len, _ = output.shape
+            # 16 attention heads. each 64 dim
             reshaped_output = output.view(batch_size, seq_len, 16, 64)
             for head_idx in range(16):
                 head_activation = reshaped_output[:, :, head_idx, :]
-                threadlocal.attention_heads[f'{name}_head_{head_idx}'] = head_activation.detach()
+                _thread_local.attention_heads[f'{name}_head_{head_idx}'] = head_activation.detach()
         return hook
-    
+
     def get_mlp_output(name):
         def hook(module, input, output):
-            if not hasattr(threadlocal, 'mlp_outputs'):
-                threadlocal.mlp_outputs = {}
-            threadlocal.mlp_outputs[name] = output.detach()
+            if not hasattr(_thread_local, 'mlp_outputs'):
+                _thread_local.mlp_outputs = {}
+            _thread_local.mlp_outputs[name] = output.detach()
         return hook
-    
+        
     for i in range(cfg.num_blocks_vit):
-        feedforward_module = model.module.transformer.elo_layers[i][1]
-        feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
-        
-        attention_module = model.module.transformer.elo_layers[i][0]
-        attention_module.register_forward_hook(get_attention_head(f'transformer block {i} attention heads'))
-        
-        mlp_module = model.module.transformer.elo_layers[i][1].net
-        mlp_module.register_forward_hook(get_mlp_output(f'transformer block {i} MLP outputs'))
-    
-    return threadlocal
+        if cfg.sae_residual_streams:
+            feedforward_module = model.module.transformer.elo_layers[i][1]
+            feedforward_module.register_forward_hook(get_activation(f'transformer block {i} hidden states'))
+        if cfg.sae_attention_heads:
+            attention_module = model.module.transformer.elo_layers[i][0]
+            attention_module.register_forward_hook(get_attention_head(f'transformer block {i} attention heads'))
+        if cfg.sae_mlp_outputs:
+            mlp_module = model.module.transformer.elo_layers[i][1].net
+            mlp_module.register_forward_hook(get_mlp_output(f'transformer block {i} MLP outputs'))
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -151,7 +150,11 @@ def parse_args(args=None):
     parser.add_argument('--input_channels', default=18, type=int)
     parser.add_argument('--vit_length', default=8, type=int)
     parser.add_argument('--elo_dim', default=128, type=int)
-    parser.add_argument('--sae_dim', default=2048, type=int)
+    parser.add_argument('--sae_dim', default=8192, type=int)
+
+    parser.add_argument('--sae_attention_heads', default=False, type=bool)
+    parser.add_argument('--sae_residual_streams', default=True, type=bool)
+    parser.add_argument('--sae_mlp_outputs', default=False, type=bool)
     
     return parser.parse_args(args)
 
@@ -189,19 +192,19 @@ def main():
                               num_workers=args.num_workers)
         break
 
-    sae_lr = 0.1
+    sae_lr = 1
     sae_site = "res"
-    sae_date = "2023-10"
-    sae = torch.load(f'maia2-sae/sae/trained_jrsaes_{sae_date}-{args.sae_dim}-{sae_lr}-{sae_site}-temp.pt')
+    sae_date = "2023-11"
+    sae = torch.load(f'maia2-sae/sae/best_jrsaes_{sae_date}-{args.sae_dim}-{sae_lr}-{sae_site}.pt')['sae_state_dicts']
         
-    threadlocal = enable_activation_hook(model, args)
+    _enable_activation_hook(model, args)
     
     logits_value_list = {i: [] for i in range(len(elo_dict))}
-    all_sae_activations = {key: [] for key in target_key_list}
+    # all_sae_activations = {key: [] for key in target_key_list}
     
     for boards, next_labels, elos_self, elos_oppo, legal_moves, side_info, wdl, board_fen in dataloader:
         logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
-        activations = getattr(threadlocal, 'residual_streams', {})
+        activations = getattr(_thread_local, 'residual_streams', {})
         sae_activations = apply_sae_to_activations(sae, activations, target_key_list)
         # for key in target_key_list:
         #     if key in sae_activations:
