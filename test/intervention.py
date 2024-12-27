@@ -365,27 +365,33 @@ def mediated_intervention(cfg, layer_one_features, elo_range, candidate_strength
                 # Best move rate
 
                 original_cnt = 0
+                denom = 0
                 for i in range(target_boards.shape[0]):
                     pred = move_dict[preds[i].item()]
-                    if pred in target_all_best_moves[i]:
-                        original_cnt += 1
-                        if elo:
-                            original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
-                    else:
-                        original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        denom += 1
+                        if pred in target_all_best_moves[i]:
+                            original_cnt += 1
+                            if elo:
+                                original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
                                 
-                original_cnt /= target_boards.shape[0]
+                # original_cnt /= target_boards.shape[0]
+                original_cnt /= denom
                 # print(f"Original rate for predicting the best {specific_square_name} move: {original_results_dict[specific_square_name][intervention_strength][elo][1]/(original_results_dict[specific_square_name][intervention_strength][elo][0]+original_results_dict[specific_square_name][intervention_strength][elo][1])}")
             
                 intervened_cnt = 0
                 for i in range(target_boards.shape[0]):
                     pred = move_dict[intervened_preds[i].item()]
-                    if pred in target_all_best_moves[i]:
-                        intervened_cnt += 1
-                        intervened_results_dict[specific_square_name][intervention_strength][elo][1] += 1
-                    else:
-                        intervened_results_dict[specific_square_name][intervention_strength][elo][0] += 1
-                intervened_cnt /= target_boards.shape[1]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        if pred in target_all_best_moves[i]:
+                            intervened_cnt += 1
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                #intervened_cnt /= target_boards.shape[1]
+                intervened_cnt /= denom
                 # print(f"Intervened rate for predicting the best {specific_square_name} move:{intervened_results_dict[specific_square_name][intervention_strength][elo][1]/(intervened_results_dict[specific_square_name][intervention_strength][elo][0]+intervened_results_dict[specific_square_name][intervention_strength][elo][1])}")
             
             intervened_pred_list = torch.stack(intervened_pred_list, dim=0)
@@ -463,6 +469,7 @@ def random_intervention(cfg, layer_one_features, elo_range, candidate_strength, 
         target_boards = board_inputs[column_indexes, :, :, :]
         target_legal_moves = legal_moves[column_indexes, :]
         target_all_best_moves = [filtered_all_best_transitional_moves[i] for i in column_indexes.tolist()]
+        target_transition_points = [filtered_transition_points[i] for i in column_indexes.tolist()]
 
         for intervention_strength in candidate_strength:
             elos_self = torch.zeros(len(target_boards))
@@ -509,31 +516,319 @@ def random_intervention(cfg, layer_one_features, elo_range, candidate_strength, 
                 # Best move rate
 
                 original_cnt = 0
+                denom = 0
                 for i in range(target_boards.shape[0]):
                     pred = move_dict[preds[i].item()]
-                    if pred in target_all_best_moves[i]:
-                        original_cnt += 1
-                        if elo:
-                            original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
-                    else:
-                        original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        denom += 1
+                        if pred in target_all_best_moves[i]:
+                            original_cnt += 1
+                            if elo:
+                                original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
                                 
-                original_cnt /= target_boards.shape[0]
+                original_cnt /= denom
                 # print(f"Original rate for predicting the best {specific_square_name} move: {original_results_dict[specific_square_name][intervention_strength][elo][1]/(original_results_dict[specific_square_name][intervention_strength][elo][0]+original_results_dict[specific_square_name][intervention_strength][elo][1])}")
             
                 random_cnt = 0
                 for i in range(target_boards.shape[0]):
                     pred = move_dict[random_preds[i].item()]
-                    if pred in target_all_best_moves[i]:
-                        random_cnt += 1
-                        random_results_dict[specific_square_name][intervention_strength][elo][1] += 1
-                    else:
-                        random_results_dict[specific_square_name][intervention_strength][elo][0] += 1
-                random_cnt /= target_boards.shape[1]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        if pred in target_all_best_moves[i]:
+                            random_cnt += 1
+                            random_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            random_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                    random_cnt /= denom
 
     end_time = time.time()
     print(f"Total time for intervention run: {(end_time - start_time):.2f}s")
     return original_results_dict, random_results_dict
+
+
+#TODO define linear probe and SV interventions
+
+def linear_probe_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict, probe_weights):
+    
+    target_key_list = ['transformer block 1 hidden states']
+    original_results_dict = {
+        k: {
+            strength: {elo: [0, 0] for elo in elo_range}
+            for strength in candidate_strength
+        }
+        for k in [key for key, value in layer_one_features.items()]
+    }
+    intervened_results_dict = {
+        k: {
+            strength: {elo: [0, 0] for elo in elo_range}
+            for strength in candidate_strength
+        }
+        for k in [key for key, value in layer_one_features.items()]
+    }
+
+    transition_points_deviation = {k:{strength: {} for strength in candidate_strength} for k in [key for key, value in layer_one_features.items()]}
+    start_time = time.time()
+
+    for specific_square_name in layer_one_features.keys():
+        
+        specific_square_idx_gt = 0
+        for key, value in layer_one_features.items():
+            if key == specific_square_name:
+                break
+            specific_square_idx_gt += 1
+        
+        if torch.sum(filtered_all_ground_truths, dim=1)[specific_square_idx_gt] < 20: # not enough samples
+            continue
+        
+        legal_moves_list = []
+        for fen in filtered_special_fens:
+            board = chess.Board(fen)
+            legal_moves_list.append(get_legal_moves_idx(board, all_moves_dict))
+        legal_moves = torch.stack(legal_moves_list)
+        
+        column_indexes = torch.where(filtered_all_ground_truths[specific_square_idx_gt] == 1)[0]
+        target_boards = board_inputs[column_indexes, :, :, :]
+        target_legal_moves = legal_moves[column_indexes, :]
+        target_all_best_moves = [filtered_all_best_transitional_moves[i] for i in column_indexes.tolist()]
+        target_transition_points = [filtered_transition_points[i] for i in column_indexes.tolist()]
+
+        for intervention_strength in candidate_strength:
+            elos_self = torch.zeros(len(target_boards))
+            elos_oppo = torch.zeros(len(target_boards))
+            
+            for elo in elo_range:
+            
+                elos_self = elos_self.fill_(elo).long()
+                elos_oppo = elos_oppo.fill_(elo).long()
+            
+                # clean run
+                _enable_activation_hook(model, cfg)
+                with torch.no_grad():
+                    logits_maia, logits_side_info, logits_value = model(target_boards, elos_self, elos_oppo)
+                    activations = getattr(_thread_local, 'residual_streams', {})
+                    sae_activations = apply_sae_to_activations(sae, activations, target_key_list)
+                    sae_reconstruct_activations = apply_sae_to_reconstruction(sae, activations, target_key_list)
+                    logits_maia_legal = logits_maia * target_legal_moves
+                    preds = logits_maia_legal.argmax(dim=-1)
+
+                intervened_internal_activations = {}
+                for key in activations:
+                    intervened_internal_activations[key] = activations[key]
+                                
+                for i in range(target_boards.shape[0]):
+                    for layer in target_key_list:
+                        intervened_internal_activations[layer][i] += intervention_strength * probe_weights[specific_square_name]
+
+                _enable_intervention_hook(model, cfg)
+                set_modified_values(intervened_internal_activations)
+                with torch.no_grad():
+                    intervened_logits_maia, intervened_logits_side_info, intervened_logits_value = model(target_boards, elos_self, elos_oppo)
+                    intervened_logits_maia_legal = intervened_logits_maia * legal_moves
+                    intervened_preds = intervened_logits_maia_legal.argmax(dim=-1)
+                clear_modified_values()
+
+                                # Best move rate
+
+                original_cnt = 0
+                denom = 0
+                for i in range(target_boards.shape[0]):
+                    pred = move_dict[preds[i].item()]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        denom += 1
+                        if pred in target_all_best_moves[i]:
+                            original_cnt += 1
+                            if elo:
+                                original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                                
+                # original_cnt /= target_boards.shape[0]
+                original_cnt /= denom
+                # print(f"Original rate for predicting the best {specific_square_name} move: {original_results_dict[specific_square_name][intervention_strength][elo][1]/(original_results_dict[specific_square_name][intervention_strength][elo][0]+original_results_dict[specific_square_name][intervention_strength][elo][1])}")
+            
+                intervened_cnt = 0
+                for i in range(target_boards.shape[0]):
+                    pred = move_dict[intervened_preds[i].item()]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        if pred in target_all_best_moves[i]:
+                            intervened_cnt += 1
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                #intervened_cnt /= target_boards.shape[1]
+                intervened_cnt /= denom
+                # print(f"Intervened rate for predicting the best {specific_square_name} move:{intervened_results_dict[specific_square_name][intervention_strength][elo][1]/(intervened_results_dict[specific_square_name][intervention_strength][elo][0]+intervened_results_dict[specific_square_name][intervention_strength][elo][1])}")
+            
+            intervened_pred_list = torch.stack(intervened_pred_list, dim=0)
+            intervened_transition_points = []
+            for i in range(intervened_pred_list.shape[1]):
+                intervened = False
+                for j in range(1, len(elo_dict) - 1):
+                    if all(move_dict[intervened_pred_list[k][i].item()] not in target_all_best_moves[i] for k in range(j)) and \
+                       all(move_dict[intervened_pred_list[k][i].item()] in target_all_best_moves[i] for k in range(j, len(elo_dict) - 1)):
+                           intervened_transition_points.append(j)
+                           intervened = True
+                if not intervened:
+                    intervened_transition_points.append(-1)
+            
+            cnt = 0
+            tot_sum = 0
+            for i in range(intervened_pred_list.shape[1]):
+                if intervened_transition_points[i] != -1:
+                    cnt += 1
+                    tot_sum += (target_transition_points[i] - intervened_transition_points[i])
+            
+            if cnt:
+                deviation = tot_sum/cnt
+            else:
+                deviation = 0
+            transition_points_deviation[specific_square_name][intervention_strength] = deviation
+
+    end_time = time.time()
+    print(f"Total time for intervention run: {(end_time - start_time):.2f}s")
+    return original_results_dict, intervened_results_dict, transition_points_deviation
+
+
+def steering_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict, steering_vectors):
+    
+    target_key_list = ['transformer block 1 hidden states']
+    original_results_dict = {
+        k: {
+            strength: {elo: [0, 0] for elo in elo_range}
+            for strength in candidate_strength
+        }
+        for k in [key for key, value in layer_one_features.items()]
+    }
+    intervened_results_dict = {
+        k: {
+            strength: {elo: [0, 0] for elo in elo_range}
+            for strength in candidate_strength
+        }
+        for k in [key for key, value in layer_one_features.items()]
+    }
+    
+    transition_points_deviation = {k:{strength: {} for strength in candidate_strength} for k in [key for key, value in layer_one_features.items()]}
+    start_time = time.time()
+    for specific_square_name in layer_one_features.keys():
+        
+        specific_square_idx_gt = 0
+        for key, value in layer_one_features.items():
+            if key == specific_square_name:
+                break
+            specific_square_idx_gt += 1
+        
+        if torch.sum(filtered_all_ground_truths, dim=1)[specific_square_idx_gt] < 20: # not enough samples
+            continue
+        
+        legal_moves_list = []
+        for fen in filtered_special_fens:
+            board = chess.Board(fen)
+            legal_moves_list.append(get_legal_moves_idx(board, all_moves_dict))
+        legal_moves = torch.stack(legal_moves_list)
+        
+        column_indexes = torch.where(filtered_all_ground_truths[specific_square_idx_gt] == 1)[0]
+        target_boards = board_inputs[column_indexes, :, :, :]
+        target_legal_moves = legal_moves[column_indexes, :]
+        target_all_best_moves = [filtered_all_best_transitional_moves[i] for i in column_indexes.tolist()]
+        target_transition_points = [filtered_transition_points[i] for i in column_indexes.tolist()]
+
+        for intervention_strength in candidate_strength:
+            elos_self = torch.zeros(len(target_boards))
+            elos_oppo = torch.zeros(len(target_boards))
+            
+            for elo in elo_range:
+            
+                elos_self = elos_self.fill_(elo).long()
+                elos_oppo = elos_oppo.fill_(elo).long()
+            
+                # clean run
+                _enable_activation_hook(model, cfg)
+                with torch.no_grad():
+                    logits_maia, logits_side_info, logits_value = model(target_boards, elos_self, elos_oppo)
+                    activations = getattr(_thread_local, 'residual_streams', {})
+                    sae_activations = apply_sae_to_activations(sae, activations, target_key_list)
+                    sae_reconstruct_activations = apply_sae_to_reconstruction(sae, activations, target_key_list)
+                    logits_maia_legal = logits_maia * target_legal_moves
+                    preds = logits_maia_legal.argmax(dim=-1)
+
+                intervened_internal_activations = {}
+                for key in activations:
+                    intervened_internal_activations[key] = activations[key]
+                                
+                for i in range(target_boards.shape[0]):
+                    for layer in target_key_list:
+                        intervened_internal_activations[layer][i] += intervention_strength * steering_vectors[specific_square_name]
+
+                _enable_intervention_hook(model, cfg)
+                set_modified_values(intervened_internal_activations)
+                with torch.no_grad():
+                    intervened_logits_maia, intervened_logits_side_info, intervened_logits_value = model(target_boards, elos_self, elos_oppo)
+                    intervened_logits_maia_legal = intervened_logits_maia * legal_moves
+                    intervened_preds = intervened_logits_maia_legal.argmax(dim=-1)
+                clear_modified_values()
+
+                                # Best move rate
+
+                original_cnt = 0
+                denom = 0
+                for i in range(target_boards.shape[0]):
+                    pred = move_dict[preds[i].item()]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        denom += 1
+                        if pred in target_all_best_moves[i]:
+                            original_cnt += 1
+                            if elo:
+                                original_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            original_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                                
+                # original_cnt /= target_boards.shape[0]
+                original_cnt /= denom
+                # print(f"Original rate for predicting the best {specific_square_name} move: {original_results_dict[specific_square_name][intervention_strength][elo][1]/(original_results_dict[specific_square_name][intervention_strength][elo][0]+original_results_dict[specific_square_name][intervention_strength][elo][1])}")
+            
+                intervened_cnt = 0
+                for i in range(target_boards.shape[0]):
+                    pred = move_dict[intervened_preds[i].item()]
+                    if (not cfg.mistakes_only or target_transition_points[i] > elo):
+                        if pred in target_all_best_moves[i]:
+                            intervened_cnt += 1
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][1] += 1
+                        else:
+                            intervened_results_dict[specific_square_name][intervention_strength][elo][0] += 1
+                #intervened_cnt /= target_boards.shape[1]
+                intervened_cnt /= denom
+                # print(f"Intervened rate for predicting the best {specific_square_name} move:{intervened_results_dict[specific_square_name][intervention_strength][elo][1]/(intervened_results_dict[specific_square_name][intervention_strength][elo][0]+intervened_results_dict[specific_square_name][intervention_strength][elo][1])}")
+            
+            intervened_pred_list = torch.stack(intervened_pred_list, dim=0)
+            intervened_transition_points = []
+            for i in range(intervened_pred_list.shape[1]):
+                intervened = False
+                for j in range(1, len(elo_dict) - 1):
+                    if all(move_dict[intervened_pred_list[k][i].item()] not in target_all_best_moves[i] for k in range(j)) and \
+                       all(move_dict[intervened_pred_list[k][i].item()] in target_all_best_moves[i] for k in range(j, len(elo_dict) - 1)):
+                           intervened_transition_points.append(j)
+                           intervened = True
+                if not intervened:
+                    intervened_transition_points.append(-1)
+            
+            cnt = 0
+            tot_sum = 0
+            for i in range(intervened_pred_list.shape[1]):
+                if intervened_transition_points[i] != -1:
+                    cnt += 1
+                    tot_sum += (target_transition_points[i] - intervened_transition_points[i])
+            
+            if cnt:
+                deviation = tot_sum/cnt
+            else:
+                deviation = 0
+            transition_points_deviation[specific_square_name][intervention_strength] = deviation
+
+    end_time = time.time()
+    print(f"Total time for intervention run: {(end_time - start_time):.2f}s")
+    return original_results_dict, intervened_results_dict, transition_points_deviation
+
 
 def find_best_intervention(original_results_dict, intervened_results_dict, elo_range):
     best_accuracies = {}
@@ -606,6 +901,7 @@ def parse_args(args=None):
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
     parser.add_argument('--side_info_coefficient', default=1, type=float)
+    parser.add_argument('--mistakes_only', default = True, type = bool)
     parser.add_argument('--intervention', default='vanilla', type=str)
 
     return parser.parse_args(args)
@@ -753,11 +1049,11 @@ def main() -> None:
     with open(output_path, 'w') as json_file:
         json.dump(filtered_data, json_file)
 
-    sae_dim = 8192
-    sae_lr = 1
+    sae_dim = 2048
+    sae_lr = 1e-5
     sae_site = "res"
-    sae_date = "2023-11"
-    sae = torch.load(f'maia2-sae/sae/best_jrsaes_{sae_date}-{sae_dim}-{sae_lr}-{sae_site}.pt')['sae_state_dicts']
+    sae_date = "2023-12"
+    sae = torch.load(f'maia2-sae/sae/{sae_date}-{sae_dim}-{sae_lr}-{sae_site}.pt')['sae_state_dicts']
 
     layer_one_features = squarewise_alarmbells.copy()
     elo_range = range(len(elo_dict) - 1) # excluding top level because all the time it predicts correctly in transitional positions
@@ -801,6 +1097,84 @@ def main() -> None:
         original_results_dict, random_results_dict = random_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict)
         # For random tests; it's not the final version of random test
         original_acc, best_random_acc = find_best_intervention(original_results_dict, random_results_dict, elo_range)
+
+    if cfg.intervention == 'probe':
+
+        probe_weights = torch.load("reverse_pooled_weights.pth")
+
+
+        original_results_dict, intervened_results_dict, transition_points_deviation = mediated_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict, probe_weights)
+        # For further visualization use
+        original_acc, best_intervened_acc = find_best_intervention(original_results_dict, intervened_results_dict, elo_range)
+
+        avg_best_accuracies = {}
+        avg_original_accuracies = {}
+
+        for elo in elo_range:
+            best_acc_sum = sum(square_acc[elo] for square_acc in best_intervened_acc.values() if elo in square_acc)
+            best_acc_count = sum(1 for square_acc in best_intervened_acc.values() if elo in square_acc)
+            
+            original_acc_sum = sum(square_acc[elo] for square_acc in original_acc.values() if elo in square_acc)
+            original_acc_count = sum(1 for square_acc in original_acc.values() if elo in square_acc)
+            
+            if best_acc_count > 0:
+                avg_best_accuracies[elo] = best_acc_sum / best_acc_count
+            
+            if original_acc_count > 0:
+                avg_original_accuracies[elo] = original_acc_sum / original_acc_count
+
+                print(avg_best_accuracies, avg_original_accuracies)
+
+        save_dir='maia2-sae/dataset/intervention'
+        results = {
+            'best_accuracies': avg_best_accuracies,
+            'original_accuracies': avg_original_accuracies
+        }
+        
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'linear_probe_intervention_accuracies.pickle')
+        with open(save_path, 'wb') as f:
+            pickle.dump(results, f)
+
+    if cfg.intervention == 'steering_vector':
+
+        steering_vectors = torch.load("steering_vectors.pth")
+
+
+        original_results_dict, intervened_results_dict, transition_points_deviation = mediated_intervention(cfg, layer_one_features, elo_range, candidate_strength, intervention_site, filtered_all_ground_truths, filtered_special_fens, filtered_all_best_transitional_moves, filtered_transition_points, board_inputs, sae, model, move_dict, all_moves_dict, steering_vectors)
+        # For further visualization use
+        original_acc, best_intervened_acc = find_best_intervention(original_results_dict, intervened_results_dict, elo_range)
+
+        avg_best_accuracies = {}
+        avg_original_accuracies = {}
+
+        for elo in elo_range:
+            best_acc_sum = sum(square_acc[elo] for square_acc in best_intervened_acc.values() if elo in square_acc)
+            best_acc_count = sum(1 for square_acc in best_intervened_acc.values() if elo in square_acc)
+            
+            original_acc_sum = sum(square_acc[elo] for square_acc in original_acc.values() if elo in square_acc)
+            original_acc_count = sum(1 for square_acc in original_acc.values() if elo in square_acc)
+            
+            if best_acc_count > 0:
+                avg_best_accuracies[elo] = best_acc_sum / best_acc_count
+            
+            if original_acc_count > 0:
+                avg_original_accuracies[elo] = original_acc_sum / original_acc_count
+
+                print(avg_best_accuracies, avg_original_accuracies)
+
+        save_dir='maia2-sae/dataset/intervention'
+        results = {
+            'best_accuracies': avg_best_accuracies,
+            'original_accuracies': avg_original_accuracies
+        }
+        
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'steering_vector_intervention_accuracies.pickle')
+        with open(save_path, 'wb') as f:
+            pickle.dump(results, f)
+
+
 
     if cfg.intervention == 'patching':
         # TODO later
