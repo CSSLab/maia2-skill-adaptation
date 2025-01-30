@@ -29,15 +29,36 @@ def is_square_under_offensive_threat(fen: str, square_index: int) -> bool:
         return False
     return len(board.attackers(chess.WHITE, square_index)) > len(board.attackers(chess.BLACK, square_index))
 
+def is_attacking_opportunity_taken(fen: str, move: str, square_index: int) -> bool:
+    board = chess.Board(fen)
+    piece_before_move = board.piece_at(square_index)
+    
+    def has_attacking_advantage(board: chess.Board, square_index: int) -> bool:
+        attackers = board.attackers(chess.WHITE, square_index)
+        defenders = board.attackers(chess.BLACK, square_index)
+        return len(attackers) > len(defenders)
+
+    had_advantage_before = (has_attacking_advantage(board, square_index) and 
+                          piece_before_move is not None and 
+                          piece_before_move.color == chess.BLACK)
+    
+    move_obj = chess.Move.from_uci(move)
+    if not board.is_legal(move_obj):
+        raise ValueError(f"Illegal move: {move}")
+
+    is_capture_of_target = (move_obj.to_square == square_index)
+    
+    return had_advantage_before and is_capture_of_target
+
 class SAEIntervention:
     def __init__(self, cfg):
         self.cfg = cfg
         self.model = self._load_model()
         self.sae = self._load_sae()
         self.best_features = self._load_best_features()
-        self.intervention_strengths = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100]
+        self.intervention_strengths = [1, 2, 5, 10, 20]
         self.scenarios = ['amplify_awareness', 'ablate_awareness']
-        self.top_ns = [1, 5, 10, 20]
+        self.top_ns = [1, 5, 10]
 
         self._enable_intervention_hook()
 
@@ -76,18 +97,18 @@ class SAEIntervention:
                     }
         return processed
 
-    def _generate_batches(self, batch_size=256):
+    def _generate_batches(self, data_type='train', batch_size=256):
         base_path = "maia2-sae/dataset/blundered-transitional-dataset"
-        cache_dir = os.path.join(base_path, 'cache_offensive')
+        cache_dir = os.path.join(base_path, f'cache_offensive_willingness_{data_type}')
         os.makedirs(cache_dir, exist_ok=True)
         
-        with open(f"{base_path}/test_moves.csv", 'r') as f:
+        with open(f"{base_path}/{data_type}_moves.csv", 'r') as f:
             data = [line for line in csv.DictReader(f)]
         
         squares = [chess.square_name(sq) for sq in range(64)]
-        for square in tqdm(squares, desc="Processing squares"):
+        for square in tqdm(squares, desc=f"Processing {data_type} squares"):
             square_hash = hashlib.md5(square.encode()).hexdigest()
-            cache_file = os.path.join(cache_dir, f"test_{square_hash}.pkl")
+            cache_file = os.path.join(cache_dir, f"{data_type}_{square_hash}.pkl")
             
             if os.path.exists(cache_file):
                 with open(cache_file, 'rb') as f:
@@ -137,7 +158,7 @@ class SAEIntervention:
         piece = board.piece_at(square_idx)
         if piece is None or piece.color != chess.BLACK:
             return False
-        return is_square_under_offensive_threat(fen, square_idx)
+        return is_attacking_opportunity_taken(fen, move, square_idx)
 
     def _create_intervention(self, scenario, strength, square, top_n=1):
         interventions = defaultdict(dict)
@@ -220,80 +241,108 @@ class SAEIntervention:
         
         return logits
 
-    def _evaluate_batch(self, batch, results):
-        square = batch['square']
-        legal_moves = batch['legal_moves']
+    def find_optimal_parameters(self):
+        print("Finding optimal parameters on training set...")
+        train_results = defaultdict(lambda: defaultdict(list))
         
-        if 'original_tps' not in results:
-            results['original_tps'] = []
-            results['transition_shifts'] = {}
+        train_batches = list(self._generate_batches(data_type='train'))
+        for batch in tqdm(train_batches, desc="Processing training batches"):
+            square = batch['square']
+            legal_moves = batch['legal_moves']
+            
+            for scenario in self.scenarios:
+                for strength in self.intervention_strengths:
+                    for top_n in self.top_ns:
+                        interventions = self._create_intervention(scenario, strength, square, top_n)
+                        
+                        for elo in ELO_RANGE:
+                            key = (scenario, square, elo)
+                            elos_self = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                            elos_oppo = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                            
+                            logits = self._apply_intervention(batch['boards'], elos_self, elos_oppo, interventions)
+                            probs = (logits * legal_moves.to(DEVICE)).softmax(-1)
+                            
+                            correct = sum(
+                                ALL_MOVE_DICT[prob.argmax().item()] == batch['correct_moves'][i]
+                                for i, prob in enumerate(probs)
+                            )
+                            accuracy = correct / len(batch['boards'])
+                            
+                            train_results[key][f"{strength}_{top_n}"].append(accuracy)
         
-        results['original_tps'].extend(batch['transition_points'])
+        self.optimal_params = {}
+        for key in train_results:
+            scenario, square, elo = key
+            param_accuracies = {param: np.mean(accs) for param, accs in train_results[key].items()}
+            
+            if scenario == 'amplify_awareness':
+                best_param = max(param_accuracies, key=param_accuracies.get)
+            else:  # ablate_awareness
+                best_param = min(param_accuracies, key=param_accuracies.get)
+                
+            strength, top_n = map(int, best_param.split('_'))
+            self.optimal_params[key] = (strength, top_n)
         
-        best_amplify = defaultdict(lambda: (-1, -1, 0))  
-        worst_ablate = defaultdict(lambda: (float('inf'), -1, 0))
+        print("Optimal parameters found!")
 
-        for scenario in self.scenarios:
-            for strength in self.intervention_strengths:
-                for top_n in self.top_ns:
+    def evaluate_test_set(self):
+        print("Evaluating on test set with optimal parameters...")
+        test_results = {}
+        
+        test_batches = list(self._generate_batches(data_type='test'))
+        for batch in tqdm(test_batches, desc="Processing test batches"):
+            square = batch['square']
+            legal_moves = batch['legal_moves']
+            
+            if 'original_tps' not in test_results:
+                test_results['original_tps'] = []
+            test_results['original_tps'].extend(batch['transition_points'])
+            
+            for scenario in self.scenarios:
+                for elo in ELO_RANGE:
+                    key = (scenario, square, elo)
+                    if key not in self.optimal_params:
+                        continue
+                        
+                    strength, top_n = self.optimal_params[key]
                     interventions = self._create_intervention(scenario, strength, square, top_n)
                     
-                    for elo in ELO_RANGE:
-                        elos_self = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
-                        elos_oppo = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
-                        
-                        logits = self._apply_intervention(batch['boards'], elos_self, elos_oppo, interventions)
-                        probs = (logits * legal_moves.to(DEVICE)).softmax(-1)
-                        
-                        correct = sum(
-                            ALL_MOVE_DICT[prob.argmax().item()] == batch['correct_moves'][i]
-                            for i, prob in enumerate(probs)
-                        )
-                        accuracy = correct / len(batch['boards'])
+                    elos_self = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                    elos_oppo = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                    
+                    logits = self._apply_intervention(batch['boards'], elos_self, elos_oppo, interventions)
+                    probs = (logits * legal_moves.to(DEVICE)).softmax(-1)
+                    
+                    correct = sum(
+                        ALL_MOVE_DICT[prob.argmax().item()] == batch['correct_moves'][i]
+                        for i, prob in enumerate(probs)
+                    )
+                    
+                    result_key = (scenario, square, elo)
+                    if result_key not in test_results:
+                        test_results[result_key] = {'total': 0, 'correct': 0, 'params': (strength, top_n)}
+                    test_results[result_key]['total'] += len(batch['boards'])
+                    test_results[result_key]['correct'] += correct
 
-                        if scenario == 'amplify_awareness':
-                            current_best = best_amplify[(square, elo)]
-                            if accuracy > current_best[0]:
-                                best_amplify[(square, elo)] = (accuracy, strength, top_n)
-                        else:
-                            current_worst = worst_ablate[(square, elo)]
-                            if accuracy < current_worst[0]:
-                                worst_ablate[(square, elo)] = (accuracy, strength, top_n)
-                        
-                        result_key = (scenario, strength, square, elo, top_n)
-                        if result_key not in results:
-                            results[result_key] = {'total': 0, 'correct': 0}
-                        results[result_key]['total'] += len(batch['boards'])
-                        results[result_key]['correct'] += correct
-
-        for (square, elo), (acc, strength, top_n) in best_amplify.items():
-            result_key = ('amplify_awareness', 'best', square, elo)
-            source_key = ('amplify_awareness', strength, square, elo, top_n)
-            results[result_key] = results[source_key].copy()
-            results[result_key].update({'top_n': top_n, 'strength': strength})
-            
-        for (square, elo), (acc, strength, top_n) in worst_ablate.items():
-            result_key = ('ablate_awareness', 'worst', square, elo)
-            source_key = ('ablate_awareness', strength, square, elo, top_n)
-            results[result_key] = results[source_key].copy()
-            results[result_key].update({'top_n': top_n, 'strength': strength})
+        return test_results
 
     def run_experiment(self):
-        results = {}
+        self.find_optimal_parameters()
         
-        print("Running experiment with all strengths and top_n features...")
-        test_batches = list(self._generate_batches())
-        for batch in tqdm(test_batches, desc="Processing batches"):
-            self._evaluate_batch(batch, results)
-            
-        self._save_results(results, 'maia2-sae/intervention_results/final_intervention_results_offensive_multi.pkl')
-        return results
+        with open('maia2-sae/intervention_results/optimal_params.pkl', 'wb') as f:
+            pickle.dump(self.optimal_params, f)
+
+        test_results = self.evaluate_test_set()
+        self._save_results(test_results, 'maia2-sae/intervention_results/final_optimized_intervention_results_offensive.pkl')
+        return test_results
 
     def _save_results(self, results, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump({
                 'test_results': results,
+                'optimal_params': self.optimal_params,
                 'original_tps': results.get('original_tps', [])
             }, f)
 
