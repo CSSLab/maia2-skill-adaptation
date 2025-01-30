@@ -9,7 +9,6 @@ from collections import defaultdict
 import csv
 import threading
 import hashlib
-import pdb
 from typing import Dict, Any, List, Tuple
 
 from maia2.utils import board_to_tensor, create_elo_dict, get_all_possible_moves, get_side_info
@@ -24,28 +23,12 @@ ALL_MOVE_DICT = {i: move for i, move in enumerate(all_moves)}
 
 _thread_local = threading.local()
 
-def is_piece_no_longer_under_attack(fen: str, move: str, square_index: int) -> bool:
+def is_square_under_offensive_threat(fen: str, square_index: int) -> bool:
     board = chess.Board(fen)
-    piece_before_move = board.piece_at(square_index)
-
-    def is_under_attack(board: chess.Board, square_index: int) -> bool:
-        attackers = board.attackers(chess.BLACK, square_index) 
-        defenders = board.attackers(chess.WHITE, square_index)  
-        return len(attackers) > len(defenders)
-
-    was_under_attack_before = (is_under_attack(board, square_index) and 
-                             piece_before_move is not None and 
-                             piece_before_move.color != chess.BLACK)
-    
-    move_obj = chess.Move.from_uci(move)
-    if not board.is_legal(move_obj):
-        raise ValueError(f"Illegal move: {move}")
-
-    board.push(move_obj)
-    piece_after_move = board.piece_at(square_index)
-    is_under_attack_after = is_under_attack(board, square_index) and piece_after_move is not None
-
-    return was_under_attack_before and not is_under_attack_after
+    piece = board.piece_at(square_index)
+    if piece is None or piece.color != chess.BLACK:
+        return False
+    return len(board.attackers(chess.WHITE, square_index)) > len(board.attackers(chess.BLACK, square_index))
 
 class SAEIntervention:
     def __init__(self, cfg):
@@ -53,11 +36,9 @@ class SAEIntervention:
         self.model = self._load_model()
         self.sae = self._load_sae()
         self.best_features = self._load_best_features()
-        self.intervention_strengths = [1, 2, 5, 10, 20, 50, 100]
-        self.scenarios = [
-            'amplify_awareness', 'amplify_willingness', 'amplify_both',
-            'ablate_awareness', 'ablate_willingness', 'ablate_both'
-        ]
+        self.intervention_strengths = [0.5, 1, 2, 5, 10, 20, 50, 100]
+        self.scenarios = ['amplify_awareness', 'ablate_awareness']
+
         self._enable_intervention_hook()
 
     def _load_model(self):
@@ -76,8 +57,7 @@ class SAEIntervention:
         features = {}
         for layer in ['layer6', 'layer7']:
             features[layer] = {
-                'awareness': pickle.load(open(f'maia2-sae/dataset/intervention/{layer}_offensive_awareness.pickle', 'rb')),
-                'willingness': pickle.load(open(f'maia2-sae/dataset/intervention/{layer}_offensive_willingness.pickle', 'rb'))
+                'awareness': pickle.load(open(f'maia2-sae/dataset/intervention/{layer}_offensive_awareness.pickle', 'rb'))
             }
         return self._process_best_features(features)
     
@@ -85,7 +65,7 @@ class SAEIntervention:
         processed = {}
         for layer in ['layer6', 'layer7']:
             processed[layer] = {}
-            for concept in ['awareness', 'willingness']:
+            for concept in ['awareness']:
                 for square, feature_list in raw_features[layer][concept].items():
                     if feature_list:
                         best_feature = feature_list[0]
@@ -96,18 +76,18 @@ class SAEIntervention:
                         }
         return processed
 
-    def _generate_batches(self, split='train', batch_size=256):
+    def _generate_batches(self, batch_size=256):
         base_path = "maia2-sae/dataset/blundered-transitional-dataset"
         cache_dir = os.path.join(base_path, 'cache_offensive')
         os.makedirs(cache_dir, exist_ok=True)
         
-        with open(f"{base_path}/{split}_moves.csv", 'r') as f:
+        with open(f"{base_path}/test_moves.csv", 'r') as f:
             data = [line for line in csv.DictReader(f)]
         
         squares = [chess.square_name(sq) for sq in range(64)]
         for square in tqdm(squares, desc="Processing squares"):
             square_hash = hashlib.md5(square.encode()).hexdigest()
-            cache_file = os.path.join(cache_dir, f"{split}_{square_hash}.pkl")
+            cache_file = os.path.join(cache_dir, f"test_{square_hash}.pkl")
             
             if os.path.exists(cache_file):
                 with open(cache_file, 'rb') as f:
@@ -124,7 +104,6 @@ class SAEIntervention:
                 move_dict = eval(line['moves'])
                 correct_move = move_dict['10']
                 if self._is_square_relevant(fen, correct_move, square_idx):
-                    # Precompute legal moves and side info
                     board = chess.Board(fen)
                     legal_moves, _ = get_side_info(board, correct_move, MOVE_DICT)
                     
@@ -156,22 +135,22 @@ class SAEIntervention:
     def _is_square_relevant(self, fen, move, square_idx):
         board = chess.Board(fen)
         piece = board.piece_at(square_idx)
-        if piece is None or piece.color != chess.WHITE:
+        if piece is None or piece.color != chess.BLACK:
             return False
-        return is_piece_no_longer_under_attack(fen, move, square_idx)
+        return is_square_under_offensive_threat(fen, square_idx)
 
     def _create_intervention(self, scenario, strength, square):
         interventions = defaultdict(dict)
         for layer in ['layer6', 'layer7']:
-            for concept in ['awareness', 'willingness']:
-                feature_info = self.best_features[layer].get(f"{concept}_{square}")
-                if feature_info:
-                    layer_key = feature_info['layer_key']
-                    feature_idx = feature_info['index']
-                    if 'amplify' in scenario:
-                        interventions[layer_key][feature_idx] = strength if concept in scenario else 1.0
-                    elif 'ablate' in scenario:
-                        interventions[layer_key][feature_idx] = -strength if concept in scenario else 1.0
+            feature_info = self.best_features[layer].get(f"awareness_{square}")
+            if feature_info:
+                layer_key = feature_info['layer_key']
+                feature_idx = feature_info['index']
+                # feature_idx = np.random.randint(0, 16384)
+                if scenario == 'amplify_awareness':
+                    interventions[layer_key][feature_idx] = strength
+                elif scenario == 'ablate_awareness':
+                    interventions[layer_key][feature_idx] = -strength
         return interventions
 
     def _enable_intervention_hook(self):
@@ -241,45 +220,26 @@ class SAEIntervention:
         
         return logits
 
-    def _evaluate_batch(self, batch, results, mode='train'):
-        
-        def is_transitional(maia_data: Dict[int, Dict[str, Any]], best_moves: List[str]) -> Tuple[bool, int]:
-            moves = [data['top_maia_move'] for data in maia_data.values()]
-            elo_categories = sorted(maia_data.keys())
-
-            if all(move in best_moves for move in moves):
-                return False, -1
-
-            for x in range(1, len(elo_categories)):
-                if all(moves[i] not in best_moves for i in range(x)) and \
-                all(moves[i] in best_moves for i in range(x, len(moves))):
-                    return True, elo_categories[x]
-            return False, -1
-        
+    def _evaluate_batch(self, batch, results):
         square = batch['square']
-        scenarios = self.scenarios
-        strengths = self.intervention_strengths if mode == 'train' else ['best']
         legal_moves = batch['legal_moves']
         
-        if 'transition_shifts' not in results:
-            results['transition_shifts'] = {}
         if 'original_tps' not in results:
             results['original_tps'] = []
+            results['transition_shifts'] = {}
         
         results['original_tps'].extend(batch['transition_points'])
         
-        for scenario in scenarios:
-            for strength in strengths:
-                actual_strength = strength
-                
-                if mode == 'train':
-                    interventions = self._create_intervention(scenario, actual_strength, square)
+        best_performance = defaultdict(lambda: float('-inf'))
+        worst_performance = defaultdict(lambda: float('inf'))
+        best_strengths = defaultdict(lambda: 1)
+        
+        for scenario in self.scenarios:
+            for strength in self.intervention_strengths:
+                interventions = self._create_intervention(scenario, strength, square)
                 predictions = [{} for _ in range(len(batch['boards']))]
                 
                 for elo in ELO_RANGE:
-                    if mode == 'test':
-                        actual_strength = self.best_strengths[scenario][square][elo]
-                        interventions = self._create_intervention(scenario, actual_strength, square)
                     elos_self = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
                     elos_oppo = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
                     
@@ -289,103 +249,48 @@ class SAEIntervention:
                     probs = (logits * legal_moves).softmax(-1)
                     
                     correct = 0
-                    transition_success = 0
-                    transition_failure = 0
-                    for i, (prob, tp) in enumerate(zip(probs, batch['transition_points'])):
+                    for i, prob in enumerate(probs):
                         pred_move = ALL_MOVE_DICT[prob.argmax().item()]
                         predictions[i][elo] = pred_move
-
                         if pred_move == batch['correct_moves'][i]:
                             correct += 1
-                            if elo < tp:
-                                transition_success += 1
-                        else:
-                            if elo >= tp:
-                                transition_failure += 1
                     
-                    result_key = (scenario, strength if mode == 'train' else 'best', square, elo)
+                    accuracy = correct / len(batch['boards'])
+                    
+                    if scenario == 'amplify_awareness':
+                        if accuracy > best_performance[(square, elo)]:
+                            best_performance[(square, elo)] = accuracy
+                            best_strengths[(scenario, square, elo)] = strength
+                    else:
+                        if accuracy < worst_performance[(square, elo)]:
+                            worst_performance[(square, elo)] = accuracy
+                            best_strengths[(scenario, square, elo)] = strength
+                            
+                    result_key = (scenario, strength, square, elo)
                     if result_key not in results:
                         results[result_key] = {
                             'total': 0,
-                            'correct': 0,
-                            'transition_success': 0,
-                            'transition_failure': 0
+                            'correct': 0
                         }
                     results[result_key]['total'] += len(batch['boards'])
                     results[result_key]['correct'] += correct
-                    results[result_key]['transition_success'] += transition_success
-                    results[result_key]['transition_failure'] += transition_failure
+
+        for scenario in self.scenarios:
+            for elo in ELO_RANGE:
+                strength = best_strengths[(scenario, square, elo)]
+                result_key_best = (scenario, 'best', square, elo)
+                result_key_original = (scenario, strength, square, elo)
                 
-                total_shift = 0
-                count = 0
-                for i in range(len(batch['boards'])):
-
-                    maia_data = {elo: {'top_maia_move': move} for elo, move in predictions[i].items()}
-                    correct_move = [batch['correct_moves'][i]]
-                    is_trans, new_tp = is_transitional(maia_data, correct_move)
-                    
-                    if is_trans:
-                        original_tp = batch['transition_points'][i]
-                        total_shift += (new_tp - original_tp)
-                        count += 1
-
-                result_key_trans = (scenario, strength if mode == 'train' else 'best', square)
-                if result_key_trans not in results['transition_shifts']:
-                    results['transition_shifts'][result_key_trans] = {'sum': 0, 'count': 0}
-                results['transition_shifts'][result_key_trans]['sum'] += total_shift
-                results['transition_shifts'][result_key_trans]['count'] += count
+                if result_key_original in results:
+                    results[result_key_best] = results[result_key_original].copy()
 
     def run_experiment(self):
-        results = {'train': {}, 'test': {}}
+        results = {}
         
-        print("Training phase - finding optimal strengths")
-        train_batches = list(self._generate_batches('train'))
-        for batch in tqdm(train_batches, desc="Processing training batches"):
-            self._evaluate_batch(batch, results['train'], mode='train')
-
-        self.best_strengths = {}
-        for scenario in self.scenarios:
-            self.best_strengths[scenario] = {}
-            for square in [chess.square_name(sq) for sq in range(64)]:
-                self.best_strengths[scenario][square] = {}
-                for elo in ELO_RANGE:
-                    self.best_strengths[scenario][square][elo] = 1
-        
-        print("\nDetermining best strengths...")
-        squares = [chess.square_name(sq) for sq in range(64)]
-        for scenario in self.scenarios:
-            for square in squares:
-                strength_acc = []
-                for strength in self.intervention_strengths:
-                    accuracies = []
-                    for elo in ELO_RANGE:
-                        key = (scenario, strength, square, elo)
-                        if key in results['train']:
-                            entry = results['train'][key]
-                            if entry['total'] > 0:
-                                acc = entry['correct'] / entry['total']
-                                accuracies.append(acc)
-                    if accuracies:
-                        strength_acc.append((strength, np.mean(accuracies)))
-                
-                if strength_acc:
-                    best_strength = max(strength_acc, key=lambda x: x[1])[0]
-                    self.best_strengths[scenario][square][elo] = best_strength
-                else:
-                    self.best_strengths[scenario][square][elo] = 1
-
-        self.best_strengths = {
-            scenario: {
-                square: dict(elo_dict) 
-                for square, elo_dict in square_dict.items()
-            }
-            for scenario, square_dict in self.best_strengths.items()
-        }
-
-        print("\nTesting phase with optimized strengths")
-        test_batches = list(self._generate_batches('test'))
-        for batch in tqdm(test_batches, desc="Processing test batches"):
-            self._evaluate_batch(batch, results['test'], mode='test')
+        print("Running experiment with all strengths...")
+        test_batches = list(self._generate_batches())
+        for batch in tqdm(test_batches, desc="Processing batches"):
+            self._evaluate_batch(batch, results)
             
         self._save_results(results, 'maia2-sae/intervention_results/final_intervention_results_offensive.pkl')
         return results
@@ -394,9 +299,8 @@ class SAEIntervention:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump({
-                'train_results': results['train'],
-                'test_results': results['test'],
-                'best_strengths': self.best_strengths
+                'test_results': results,
+                'original_tps': results.get('original_tps', [])
             }, f)
 
 class InterventionConfig:
