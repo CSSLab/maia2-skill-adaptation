@@ -108,7 +108,8 @@ def process_sae_feature(args: Tuple[int, torch.Tensor, torch.Tensor]) -> Tuple[i
 def cache_examples_and_activations(concept_functions: Dict[str, Any],
                                  concept_names: List[str],
                                  sae_activations: Dict[str, torch.Tensor],
-                                 board_fens: List[str]) -> Dict[str, Dict[str, torch.Tensor]]:
+                                 board_fens: List[str],
+                                 preds: List[str]) -> Dict[str, Dict[str, torch.Tensor]]:
     samples_and_activations = {}
     
     for concept_name, concept_func in concept_functions.items():
@@ -197,7 +198,7 @@ def main():
     sae_lr = 1
     sae_site = "res"
     
-    with open(f'maia2-sae/activations/maia2_activations_for_sae_{test_dim}_{sae_lr}_{sae_site}.pickle', 'rb') as f:
+    with open(f'maia2-sae/activations/finetuned_maia2_activations_for_sae_{test_dim}_{sae_lr}_{sae_site}.pickle', 'rb') as f:
         maia2_activations = pickle.load(f)
 
     target_key_list = ['transformer block 0 hidden states', 'transformer block 1 hidden states']
@@ -205,12 +206,18 @@ def main():
     move_independent_header, function_map = initialize_concept_functions()
     sae_activations = maia2_activations['all_sae_activations']
     board_fens = maia2_activations['board_fen']
+
+    all_moves = get_all_possible_moves()
+    all_moves_dict = {i: move for i, move in enumerate(all_moves)}
+    preds = [all_moves_dict[int(idx)] for idx in maia2_activations['preds']]
+    print("Total Positions: ", len(preds))
     
     samples_and_activations = cache_examples_and_activations(
         function_map,
         move_independent_header,
         sae_activations,
-        board_fens
+        board_fens,
+        preds
     )
     
     results = analyze_concepts(
@@ -228,10 +235,10 @@ def main():
         offensive_results = {k: v for k, v in results[layer_key].items() 
                            if k.startswith('offensive_awareness_')}
 
-        with open(f'maia2-sae/dataset/intervention/{layer_name}_defensive_awareness.pickle', 'wb') as f:
+        with open(f'maia2-sae/dataset/intervention/finetuned_{layer_name}_defensive_awareness.pickle', 'wb') as f:
             pickle.dump(defensive_results, f)
             
-        with open(f'maia2-sae/dataset/intervention/{layer_name}_offensive_awareness.pickle', 'wb') as f:
+        with open(f'maia2-sae/dataset/intervention/finetuned_{layer_name}_offensive_awareness.pickle', 'wb') as f:
             pickle.dump(offensive_results, f)
 
 if __name__ == "__main__":
