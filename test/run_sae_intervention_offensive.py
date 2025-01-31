@@ -327,6 +327,151 @@ class SAEIntervention:
 
         return test_results
 
+    # intervention with post-intervention probing 
+    def evaluate_test_set_with_probing(self):
+        print("Evaluating on test set with optimal parameters...")
+        test_results = {}
+        activation_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        
+        test_batches = list(self._generate_batches(data_type='test'))
+        for batch in tqdm(test_batches, desc="Processing test batches"):
+            square = batch['square']
+            legal_moves = batch['legal_moves']
+            
+            if 'original_tps' not in test_results:
+                test_results['original_tps'] = []
+            test_results['original_tps'].extend(batch['transition_points'])
+            
+            for scenario in self.scenarios:
+                for elo in ELO_RANGE:
+                    key = (scenario, square, elo)
+                    if key not in self.optimal_params:
+                        continue
+                    
+                    strength, top_n = self.optimal_params[key]
+                    interventions = self._create_intervention(scenario, strength, square, top_n)
+                    
+                    elos_self = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                    elos_oppo = torch.full((len(batch['boards']),), elo, device=DEVICE).long()
+                    
+                    logits, decoded_vectors = self._apply_intervention(
+                        batch['boards'], elos_self, elos_oppo, interventions
+                    )
+                    
+                    probs = (logits * legal_moves.to(DEVICE)).softmax(-1)
+                    correct = sum(
+                        ALL_MOVE_DICT[prob.argmax().item()] == batch['correct_moves'][i]
+                        for i, prob in enumerate(probs)
+                    )
+                    
+                    result_key = (scenario, square, elo)
+                    if result_key not in test_results:
+                        test_results[result_key] = {'total': 0, 'correct': 0, 'params': (strength, top_n)}
+                    test_results[result_key]['total'] += len(batch['boards'])
+                    test_results[result_key]['correct'] += correct
+
+                    for i in range(len(batch['boards'])):
+                        activation = decoded_vectors[i].detach().cpu().numpy()
+                        activation_data[scenario][elo][square].append(activation)
+
+        print("\nActivation Data Statistics:")
+        for scenario in self.scenarios:
+            print(f"\n{scenario}:")
+            for elo in ELO_RANGE:
+                if activation_data[scenario][elo]:
+                    squares = list(activation_data[scenario][elo].keys())
+                    sizes = [len(activation_data[scenario][elo][sq]) for sq in squares]
+                    print(f"ELO {ELO_DICT[elo]}: {len(squares)} squares, "
+                        f"avg {np.mean(sizes):.1f} samples/square, "
+                        f"min {min(sizes)} samples, max {max(sizes)} samples")
+
+        print("\nEvaluating intervention probes...")
+        
+        probe_results = defaultdict(lambda: defaultdict(list))
+        
+        for scenario in tqdm(self.scenarios, desc="Processing scenarios"):
+            for elo in ELO_RANGE:
+                if not activation_data[scenario][elo]:
+                    continue
+                    
+                squares = list(activation_data[scenario][elo].keys())
+                print(f"\n{scenario} - ELO {ELO_DICT[elo]}: Processing {len(squares)} squares")
+                
+                for square_idx, square in enumerate(squares):
+                    positive_activations = activation_data[scenario][elo][square]
+                    if not positive_activations:
+                        continue
+                        
+                    # Get multiple negative squares for better balance
+                    neg_indices = [(square_idx + i + 1) % len(squares) for i in range(3)]
+                    neg_squares = [squares[i] for i in neg_indices]
+                    negative_activations = []
+                    for neg_square in neg_squares:
+                        negative_activations.extend(activation_data[scenario][elo][neg_square])
+                    
+                    if not negative_activations:
+                        continue
+                    
+                    min_size = min(len(positive_activations), len(negative_activations))
+                    print(f"Square {square}: {len(positive_activations)} positive, {len(negative_activations)} negative samples")
+                    if min_size < 10:
+                        print(f"Skipping {square} due to insufficient samples")
+                        continue
+                    
+                    X_positive = np.array(positive_activations[:min_size])
+                    X_negative = np.array(negative_activations[:min_size])
+                    
+                    X = np.vstack([X_positive, X_negative])
+                    y = np.array([1] * min_size + [0] * min_size)
+                    
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                    
+                    model = LogisticRegression(max_iter=32)
+                    model.fit(X_train, y_train)
+                    
+                    y_pred_proba = model.predict_proba(X_test)[:, 1]
+                    y_pred = (y_pred_proba > 0.5).astype(int)
+                    
+                    try:
+                        auc = roc_auc_score(y_test, y_pred_proba)
+                        acc = accuracy_score(y_test, y_pred)
+                        probe_results[scenario][elo].append((auc, acc))
+                        print(f"Square {square}: AUC = {auc:.4f}, Accuracy = {acc:.4f}")
+                    except Exception as e:
+                        print(f"Error evaluating square {square}: {str(e)}")
+                        continue
+
+        # Print and store results
+        print("\nIntervention Probe Results:")
+        scenario_averages = {}
+        for scenario in self.scenarios:
+            print(f"\n{scenario.capitalize()}:")
+            elo_scores = {}
+            for elo in ELO_RANGE:
+                if probe_results[scenario][elo]:
+                    aucs, accs = zip(*probe_results[scenario][elo])
+                    avg_auc = np.mean(aucs)
+                    avg_acc = np.mean(accs)
+                    elo_scores[elo] = {'auc': avg_auc, 'accuracy': avg_acc}
+                    print(f"ELO {ELO_DICT[elo]}: Average AUC = {avg_auc:.4f}, Average Accuracy = {avg_acc:.4f}")
+            
+            if elo_scores:
+                overall_auc = np.mean([scores['auc'] for scores in elo_scores.values()])
+                overall_acc = np.mean([scores['accuracy'] for scores in elo_scores.values()])
+                print(f"Overall average for {scenario}: AUC = {overall_auc:.4f}, Accuracy = {overall_acc:.4f}")
+                scenario_averages[scenario] = {
+                    'elo_scores': elo_scores,
+                    'overall_auc': overall_auc,
+                    'overall_accuracy': overall_acc
+                }
+
+        test_results['probe_results'] = {
+            'per_scenario_elo': dict(probe_results),
+            'scenario_averages': scenario_averages
+        }
+        
+        return test_results
+
     def run_experiment(self):
         self.find_optimal_parameters()
         
