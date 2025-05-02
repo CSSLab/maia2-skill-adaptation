@@ -1,0 +1,27 @@
+# Data configuration
+seed: 42
+num_workers: 4
+verbose: 1
+max_ply: 300
+clock_threshold: 30
+chunk_size: 20000
+max_games_per_elo_range: 20
+first_n_moves: 10
+
+# Model architecture configuration
+lr: 1e-4
+wd: 1e-5
+batch_size: 64
+dim_cnn: 256
+dim_vit: 1024
+num_blocks_cnn: 5
+num_blocks_vit: 2
+input_channels: 18
+vit_length: 8
+elo_dim: 128
+
+# Training/loss configuration
+side_info: true
+side_info_coefficient: 1.0
+value: true
+value_coefficient: 1.0
