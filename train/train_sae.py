@@ -1,4 +1,26 @@
-from .hyperparam_search import * 
+import matplotlib.pyplot as plt
+import numpy as np
+from multiprocessing import Pool, cpu_count
+import torch
+import torch.nn as nn
+import tqdm
+import argparse
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from tqdm.contrib.concurrent import process_map
+import argparse
+from functools import partial
+from collections import defaultdict
+import einops
+import time
+from itertools import product
+
+from ..maia2.main import *
+from ..maia2.utils import *
+from ..test.evaluate_sae_features_on_strategic import *
+from ..test.get_self_implemented_concepts import *
+from ..test.evaluate_sae_features_on_board_reconstruction import cache_examples_and_activations_board_states
 import threading
 # import pdb
 
@@ -269,7 +291,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
             'epoch': 0
         } for key in target_key_list
     }
-    patience = 50
+    patience = 3
     patience_counter = {key: 0 for key in target_key_list}
     early_stop = False
     
@@ -432,7 +454,7 @@ def train_sae_pipeline(model, saes, cfg, pgn_chunks, all_moves_dict, elo_dict, n
                                     if cfg.sae_attention_heads:    
                                         best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att.pt'
                                     if cfg.sae_residual_streams:
-                                        best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
+                                        best_save_path = f'maia2-sae/sae/threat_finetuned_best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
                                     if cfg.sae_mlp_outputs:
                                         best_save_path = f'maia2-sae/sae/best_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp.pt'
                                     
@@ -526,7 +548,7 @@ def parse_args(args=None):
     # Tunable Arguments
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--wd', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=8192, type=int)
+    parser.add_argument('--batch_size', default=4096, type=int)
     parser.add_argument('--first_n_moves', default=10, type=int)
     parser.add_argument('--last_n_moves', default=10, type=int)
     parser.add_argument('--dim_cnn', default=256, type=int)
@@ -540,7 +562,7 @@ def parse_args(args=None):
     parser.add_argument('--side_info_coefficient', default=1, type=float)
     parser.add_argument('--value', default=True, type=bool)
     parser.add_argument('--value_coefficient', default=1, type=float)
-    parser.add_argument('--sae_dim', default=8192, type=int)
+    parser.add_argument('--sae_dim', default=16384, type=int)
     parser.add_argument('--num_sae_epochs', default=1, type=int)
     parser.add_argument('--l0_coefficient', default=1, type=float)
     # parser.add_argument('--l1_coefficient', default=0.00005, type=float)
@@ -563,7 +585,7 @@ if __name__ == '__main__':
     elo_dict = create_elo_dict()
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
-    trained_model_path = "maia2-sae/weights.v2.pt"
+    trained_model_path = "maia2-ft/model/threats_finetune_0.0001_8192_1e-05/best_model.pt"
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(trained_model_path, map_location=torch.device(device))
     model = MAIA2Model(len(all_moves), elo_dict, cfg)
@@ -620,7 +642,7 @@ if __name__ == '__main__':
     if cfg.sae_attention_heads:    
         save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-att.pt'
     if cfg.sae_residual_streams:
-        save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
+        save_path = f'maia2-sae/sae/threat_finetuned_trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-res.pt'
     if cfg.sae_mlp_outputs:
         save_path = f'maia2-sae/sae/trained_jrsaes_{cfg.test_year}-{formatted_month}-{cfg.sae_dim}-{cfg.l0_coefficient}-mlp.pt'
     torch.save(sae_state_dicts, save_path)

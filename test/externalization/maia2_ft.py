@@ -12,50 +12,71 @@ import time
 import os
 import random
 import pdb
+import pickle
+from functools import partial
 
-class BlunderedTransitionalDataset(Dataset):
+class ThreatAwareDataset(Dataset):
     def __init__(self, csv_path, all_moves_dict, cfg):
-
-        df = pd.read_csv(csv_path)
-        elo_dict = utils.create_elo_dict()
-        
-        expanded_data = []
-        for _, row in df.iterrows():
-            trans_point = row['transition_point']
-            
-            # board = chess.Board(row['fen'])
-            # is_black_to_move = not board.turn
-
-            # if is_black_to_move:
-            #     board.apply_mirror()
-            #     correct_move = utils.mirror_move(row['correct_move'])
-            # else:
-            #     correct_move = row['correct_move']
-
-            # Add positions for all ELO levels below transition point
-            # for elo_level in range(trans_point):
-
-            for elo_level in range(len(elo_dict) - 1):
-                expanded_data.append((
-                    row['fen'],
-                    row['correct_move'],
-                    elo_level,
-                    elo_level,
-                    True
-                ))
-        
-        random.seed(cfg.seed)
-        random.shuffle(expanded_data)
-        self.data = expanded_data
-        self.all_moves_dict = all_moves_dict
         self.cfg = cfg
+        self.all_moves_dict = all_moves_dict
+        self.elo_dict = utils.create_elo_dict()
+        
+        # Try to load cached filtered data
+        cache_path = csv_path.replace('.csv', '_threat_filtered.pkl')
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                self.data = pickle.load(f)
+            print(f"Loaded cached filtered data from {cache_path}")
+            return
+
+        # Process raw data if no cache exists
+        df = pd.read_csv(csv_path)
+        expanded_data = []
+        
+        # Initialize threat functions
+        self.threat_functions = []
+        for square in range(64):
+            self.threat_functions.append((
+                partial(is_square_under_defensive_threat, square_index=square),
+                partial(is_square_under_offensive_threat, square_index=square)
+            ))
+
+        print("Filtering positions with tactical threats...")
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing positions"):
+            board = chess.Board(row['fen'])
+            
+            if not board.turn:
+                board.apply_mirror()
+                correct_move = utils.mirror_move(row['correct_move'])
+            else:
+                correct_move = row['correct_move']
+
+            has_threat = any(
+                def_func(board.fen()) or off_func(board.fen())
+                for def_func, off_func in self.threat_functions
+            )
+            
+            if has_threat:
+                for elo_level in range(len(self.elo_dict) - 1):
+                    expanded_data.append((
+                        board.fen(),
+                        correct_move,
+                        elo_level,
+                        elo_level,
+                        board.turn
+                    ))
+
+        with open(cache_path, 'wb') as f:
+            pickle.dump(expanded_data, f)
+        print(f"Saved filtered data to {cache_path}")
+        
+        self.data = expanded_data
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         fen, move, elo_self, elo_oppo, white_active = self.data[idx]
-
         board = chess.Board(fen)
         board_input = utils.board_to_tensor(board)
         move_input = self.all_moves_dict[move]
@@ -63,6 +84,21 @@ class BlunderedTransitionalDataset(Dataset):
         legal_moves, side_info = utils.get_side_info(board, move, self.all_moves_dict)
         
         return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info
+
+# Add threat checking functions directly in utils
+def is_square_under_defensive_threat(fen: str, square_index: int) -> bool:
+    board = chess.Board(fen)
+    piece = board.piece_at(square_index)
+    if piece is None or piece.color != chess.WHITE:
+        return False
+    return len(board.attackers(chess.BLACK, square_index)) > len(board.attackers(chess.WHITE, square_index))
+
+def is_square_under_offensive_threat(fen: str, square_index: int) -> bool:
+    board = chess.Board(fen)
+    piece = board.piece_at(square_index)
+    if piece is None or piece.color != chess.BLACK:
+        return False
+    return len(board.attackers(chess.WHITE, square_index)) > len(board.attackers(chess.BLACK, square_index))
 
 def calculate_accuracy(logits, labels, legal_moves):
     logits = logits * legal_moves
@@ -74,7 +110,7 @@ def calculate_accuracy(logits, labels, legal_moves):
 def run_ft():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    with open('../maia2/finetune_config.yaml', 'r') as f:
+    with open('configs/finetune_config.yaml', 'r') as f:
         cfg_dict = yaml.safe_load(f)
     
     class Config:
@@ -88,7 +124,7 @@ def run_ft():
         print(f'\t{arg}: {getattr(cfg, arg)}', flush=True)
     
     utils.seed_everything(cfg.seed)
-    save_root = f'model/finetune_{cfg.lr}_{cfg.batch_size}_{cfg.wd}/'
+    save_root = f'model/threats_finetune_{cfg.lr}_{cfg.batch_size}_{cfg.wd}/'
     os.makedirs(save_root, exist_ok=True)
 
     all_moves = utils.get_all_possible_moves()
@@ -96,24 +132,26 @@ def run_ft():
     elo_dict = utils.create_elo_dict()
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
-    trained_model_path = "../weights.v2.pt"
+    trained_model_path = "maia2-sae/weights.v2.pt"
     ckpt = torch.load(trained_model_path, map_location=device)
     model = main.MAIA2Model(len(all_moves), elo_dict, cfg)
     model = torch.nn.DataParallel(model)
     model.load_state_dict(ckpt['model_state_dict'])
-    
-    # model = model.to(device)
-    # model = torch.nn.DataParallel(model) 
-    # model.eval()
 
-    train_dataset = BlunderedTransitionalDataset(
-        '../dataset/blundered-transitional-dataset/train_moves.csv',
+    train_dataset = ThreatAwareDataset(
+        'maia2-sae/dataset/blundered-transitional-dataset/train_moves.csv',
         all_moves_dict,
         cfg
     )
 
-    val_dataset = BlunderedTransitionalDataset(
-        '../dataset/blundered-transitional-dataset/val_moves.csv',
+    val_dataset = ThreatAwareDataset(
+        'maia2-sae/dataset/blundered-transitional-dataset/val_moves.csv',
+        all_moves_dict,
+        cfg
+    )
+
+    test_dataset = ThreatAwareDataset(
+        'maia2-sae/dataset/blundered-transitional-dataset/test_moves.csv',
         all_moves_dict,
         cfg
     )
@@ -147,9 +185,9 @@ def run_ft():
         start_time = time.time()
         
         model.train()
-        train_loss = 0
-        train_acc = 0
-        train_steps = 0
+        window_loss = 0
+        window_acc = 0
+        window_steps = 0
         
         for batch_idx, batch in enumerate(tqdm(train_loader)):
             boards, labels, elos_self, elos_oppo, legal_moves, side_info = [x.to(device) if torch.is_tensor(x) else x for x in batch]
@@ -172,19 +210,19 @@ def run_ft():
             optimizer.step()
             
             acc = calculate_accuracy(logits_maia, labels, legal_moves)
-            train_loss += loss.item()
-            train_acc += acc
-            train_steps += 1
+            window_loss += loss.item()
+            window_acc += acc
+            window_steps += 1
             
             # Print every 10 batches
             if (batch_idx + 1) % 10 == 0:
-                avg_loss = train_loss / train_steps
-                avg_acc = train_acc / train_steps
+                avg_window_loss = window_loss / window_steps
+                avg_window_acc = window_acc / window_steps
                 print(f'Batch {batch_idx + 1}/{len(train_loader)}, '
-                      f'Loss: {avg_loss:.4f}, Accuracy: {avg_acc:.4f}', flush=True)
-        
-        avg_train_loss = train_loss / train_steps
-        avg_train_acc = train_acc / train_steps
+                      f'Loss: {avg_window_loss:.4f}, Accuracy: {avg_window_acc:.4f}', flush=True)
+                window_loss = 0
+                window_acc = 0
+                window_steps = 0
         
         # Validation
         model.eval()
@@ -218,8 +256,6 @@ def run_ft():
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': avg_train_loss,
-                'train_acc': avg_train_acc,
                 'val_loss': avg_val_loss,
                 'val_acc': avg_val_acc,
             }, f'{save_root}best_model.pt')
@@ -228,14 +264,11 @@ def run_ft():
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': avg_train_loss,
-            'train_acc': avg_train_acc,
             'val_loss': avg_val_loss,
             'val_acc': avg_val_acc,
         }, f'{save_root}epoch_{epoch + 1}.pt')
         
         print(f'Epoch {epoch + 1} completed in {utils.readable_time(time.time() - start_time)}')
-        print(f'Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_acc:.4f}')
         print(f'Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_acc:.4f}\n')
 
 if __name__=="__main__":
