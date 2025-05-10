@@ -1,5 +1,4 @@
 from maia2 import model, dataset, inference, utils, main
-# from maia2.utils import board_to_tensor, get_side_info
 import chess
 import pandas as pd
 import yaml
@@ -14,35 +13,32 @@ import random
 import pdb
 import pickle
 from functools import partial
+from maia2.main import MAIA2Model
 
 class ThreatAwareDataset(Dataset):
-    def __init__(self, csv_path, all_moves_dict, cfg):
+    def __init__(self, csv_path, all_moves_dict, cfg, is_test=False):
         self.cfg = cfg
         self.all_moves_dict = all_moves_dict
         self.elo_dict = utils.create_elo_dict()
         
-        # Try to load cached filtered data
-        cache_path = csv_path.replace('.csv', '_threat_filtered.pkl')
+        cache_path = csv_path.replace('.csv', '_defensive_threat_filtered.pkl')
+        
         if os.path.exists(cache_path):
             with open(cache_path, 'rb') as f:
                 self.data = pickle.load(f)
             print(f"Loaded cached filtered data from {cache_path}")
             return
 
-        # Process raw data if no cache exists
         df = pd.read_csv(csv_path)
         expanded_data = []
         
-        # Initialize threat functions
         self.threat_functions = []
         for square in range(64):
-            self.threat_functions.append((
-                partial(is_square_under_defensive_threat, square_index=square),
-                partial(is_square_under_offensive_threat, square_index=square)
-            ))
+            self.threat_functions.append(partial(is_square_under_defensive_threat, square_index=square))
 
-        print("Filtering positions with tactical threats...")
+        print("Filtering positions with defensive threats...")
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing positions"):
+                
             board = chess.Board(row['fen'])
             
             if not board.turn:
@@ -52,18 +48,19 @@ class ThreatAwareDataset(Dataset):
                 correct_move = row['correct_move']
 
             has_threat = any(
-                def_func(board.fen()) or off_func(board.fen())
-                for def_func, off_func in self.threat_functions
+                def_func(board.fen())
+                for def_func in self.threat_functions
             )
             
             if has_threat:
-                for elo_level in range(len(self.elo_dict) - 1):
+                for elo_level in range(len(self.elo_dict)):
                     expanded_data.append((
                         board.fen(),
                         correct_move,
                         elo_level,
                         elo_level,
-                        board.turn
+                        board.turn,
+                        row['transition_point'] if 'transition_point' in row and not pd.isna(row['transition_point']) else -1
                     ))
 
         with open(cache_path, 'wb') as f:
@@ -76,16 +73,15 @@ class ThreatAwareDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        fen, move, elo_self, elo_oppo, white_active = self.data[idx]
+        fen, move, elo_self, elo_oppo, white_active, transition_point = self.data[idx]
         board = chess.Board(fen)
         board_input = utils.board_to_tensor(board)
         move_input = self.all_moves_dict[move]
         
         legal_moves, side_info = utils.get_side_info(board, move, self.all_moves_dict)
         
-        return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info
+        return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info, transition_point
 
-# Add threat checking functions directly in utils
 def is_square_under_defensive_threat(fen: str, square_index: int) -> bool:
     board = chess.Board(fen)
     piece = board.piece_at(square_index)
@@ -93,24 +89,62 @@ def is_square_under_defensive_threat(fen: str, square_index: int) -> bool:
         return False
     return len(board.attackers(chess.BLACK, square_index)) > len(board.attackers(chess.WHITE, square_index))
 
-def is_square_under_offensive_threat(fen: str, square_index: int) -> bool:
-    board = chess.Board(fen)
-    piece = board.piece_at(square_index)
-    if piece is None or piece.color != chess.BLACK:
-        return False
-    return len(board.attackers(chess.WHITE, square_index)) > len(board.attackers(chess.BLACK, square_index))
-
 def calculate_accuracy(logits, labels, legal_moves):
     logits = logits * legal_moves
     predictions = torch.argmax(logits, dim=1)
     correct = (predictions == labels).float().sum()
     total = labels.size(0)
-    return (correct / total).item()
+    return (correct / total).item(), predictions
+
+def calculate_baseline_accuracy(transition_points, num_elo_levels):
+    accuracy_per_elo = {i: 0 for i in range(num_elo_levels)}
+    counts_per_elo = {i: 0 for i in range(num_elo_levels)}
+    
+    for tp in transition_points:
+        if tp == -1:
+            continue
+        for elo in range(num_elo_levels):
+            counts_per_elo[elo] += 1
+            if tp == 0:  
+                accuracy_per_elo[elo] += 1
+            elif tp == 10:  
+                pass  
+            else:  
+                if elo >= tp:
+                    accuracy_per_elo[elo] += 1
+    
+    for elo in range(num_elo_levels):
+        if counts_per_elo[elo] > 0:
+            accuracy_per_elo[elo] = accuracy_per_elo[elo] / counts_per_elo[elo]
+        else:
+            accuracy_per_elo[elo] = 0
+    
+    return accuracy_per_elo
+
+def find_transition_point(predictions, labels, elo_levels):
+    skill_results = {}
+    for i, elo in enumerate(elo_levels):
+        skill_results[elo] = (predictions[i] == labels[i]).item()
+    
+    if all(skill_results[elo] for elo in elo_levels):
+        return 0  
+    
+    if all(not skill_results[elo] for elo in elo_levels):
+        return 10  
+    
+    for level_idx in range(len(elo_levels) - 1):
+        curr_level = elo_levels[level_idx]
+        next_level = elo_levels[level_idx + 1]
+        if not skill_results[curr_level] and skill_results[next_level]:
+            if all(skill_results[elo_levels[i]] for i in range(level_idx + 1, len(elo_levels))):
+                return next_level
+    
+    return -1  
 
 def run_ft():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    with open('configs/finetune_config.yaml', 'r') as f:
+    with open('finetune_config.yaml', 'r') as f:
         cfg_dict = yaml.safe_load(f)
     
     class Config:
@@ -124,7 +158,7 @@ def run_ft():
         print(f'\t{arg}: {getattr(cfg, arg)}', flush=True)
     
     utils.seed_everything(cfg.seed)
-    save_root = f'model/threats_finetune_{cfg.lr}_{cfg.batch_size}_{cfg.wd}/'
+    save_root = f'ft_model/defensive_threats_finetune_{cfg.lr}_{cfg.batch_size}_{cfg.wd}/'
     os.makedirs(save_root, exist_ok=True)
 
     all_moves = utils.get_all_possible_moves()
@@ -132,28 +166,34 @@ def run_ft():
     elo_dict = utils.create_elo_dict()
     move_dict = {v: k for k, v in all_moves_dict.items()}
 
-    trained_model_path = "maia2-sae/weights.v2.pt"
+    trained_model_path = "../weights.v2.pt"
+    model = MAIA2Model(len(all_moves), elo_dict, cfg)
     ckpt = torch.load(trained_model_path, map_location=device)
-    model = main.MAIA2Model(len(all_moves), elo_dict, cfg)
-    model = torch.nn.DataParallel(model)
-    model.load_state_dict(ckpt['model_state_dict'])
+    
+    if all(k.startswith('module.') for k in ckpt['model_state_dict'].keys()):
+        model.load_state_dict({k.replace('module.', ''): v for k, v in ckpt['model_state_dict'].items()})
+    else:
+        model.load_state_dict(ckpt['model_state_dict'])
+        
+    model.eval().to(device)
 
     train_dataset = ThreatAwareDataset(
-        'maia2-sae/dataset/blundered-transitional-dataset/train_moves.csv',
+        '../blundered-transitional-dataset/train_moves.csv',
         all_moves_dict,
         cfg
     )
 
     val_dataset = ThreatAwareDataset(
-        'maia2-sae/dataset/blundered-transitional-dataset/val_moves.csv',
+        '../blundered-transitional-dataset/val_moves.csv',
         all_moves_dict,
         cfg
     )
 
     test_dataset = ThreatAwareDataset(
-        'maia2-sae/dataset/blundered-transitional-dataset/test_moves.csv',
+        '../blundered-transitional-dataset/test_moves.csv',
         all_moves_dict,
-        cfg
+        cfg,
+        is_test=True
     )
 
     train_loader = DataLoader(
@@ -172,6 +212,14 @@ def run_ft():
         drop_last=False
     )
 
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=len(elo_dict),
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        drop_last=False
+    )
+
     criterion_maia = nn.CrossEntropyLoss()
     criterion_side_info = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
@@ -179,6 +227,19 @@ def run_ft():
     N_params = utils.count_parameters(model)
     print(f'Trainable Parameters: {N_params}', flush=True)
     best_val_loss = float('inf')
+
+    print("Computing baseline performance...")
+    transition_points = [tp for _, _, _, _, _, tp in test_dataset.data][::len(elo_dict)]
+    transition_points = [tp for tp in transition_points if tp != -1]
+    baseline_accuracy = calculate_baseline_accuracy(transition_points, len(elo_dict))
+    
+    print("Baseline accuracy per ELO level:")
+    for elo, acc in baseline_accuracy.items():
+        print(f"ELO level {elo}: {acc:.4f}")
+    
+    if transition_points:
+        avg_transition_point = sum(tp for tp in transition_points if tp not in [-1, 0, 10]) / sum(1 for tp in transition_points if tp not in [-1, 0, 10]) if any(tp not in [-1, 0, 10] for tp in transition_points) else 0
+        print(f"Average transition point (baseline): {avg_transition_point:.2f}")
 
     for epoch in range(cfg.max_epochs):
         print(f'Epoch {epoch + 1}', flush=True)
@@ -190,13 +251,12 @@ def run_ft():
         window_steps = 0
         
         for batch_idx, batch in enumerate(tqdm(train_loader)):
-            boards, labels, elos_self, elos_oppo, legal_moves, side_info = [x.to(device) if torch.is_tensor(x) else x for x in batch]
-            boards = boards.to(device)
-            labels = labels.to(device)
-            elos_self = elos_self.to(device)
-            elos_oppo = elos_oppo.to(device)
-            legal_moves = legal_moves.to(device)
-            side_info = side_info.to(device)
+            boards = batch[0].to(device)
+            labels = batch[1].to(device)
+            elos_self = batch[2].to(device)
+            elos_oppo = batch[3].to(device)
+            legal_moves = batch[4].to(device)
+            side_info = batch[5].to(device)
             
             logits_maia, logits_side_info, _ = model(boards, elos_self, elos_oppo)
             
@@ -209,12 +269,11 @@ def run_ft():
             loss.backward()
             optimizer.step()
             
-            acc = calculate_accuracy(logits_maia, labels, legal_moves)
+            acc, _ = calculate_accuracy(logits_maia, labels, legal_moves)
             window_loss += loss.item()
             window_acc += acc
             window_steps += 1
             
-            # Print every 10 batches
             if (batch_idx + 1) % 10 == 0:
                 avg_window_loss = window_loss / window_steps
                 avg_window_acc = window_acc / window_steps
@@ -224,7 +283,6 @@ def run_ft():
                 window_acc = 0
                 window_steps = 0
         
-        # Validation
         model.eval()
         val_loss = 0
         val_acc = 0
@@ -232,7 +290,7 @@ def run_ft():
         
         with torch.no_grad():
             for batch in tqdm(val_loader):
-                boards, labels, elos_self, elos_oppo, legal_moves, side_info = [x.to(device) if torch.is_tensor(x) else x for x in batch]
+                boards, labels, elos_self, elos_oppo, legal_moves, side_info, _ = [x.to(device) if torch.is_tensor(x) else x for x in batch]
                 
                 logits_maia, logits_side_info, _ = model(boards, elos_self, elos_oppo)
                 
@@ -241,7 +299,7 @@ def run_ft():
                     loss_side_info = criterion_side_info(logits_side_info, side_info) * cfg.side_info_coefficient
                     loss += loss_side_info
                 
-                acc = calculate_accuracy(logits_maia, labels, legal_moves)
+                acc, _ = calculate_accuracy(logits_maia, labels, legal_moves)
                 
                 val_loss += loss.item()
                 val_acc += acc
@@ -270,6 +328,66 @@ def run_ft():
         
         print(f'Epoch {epoch + 1} completed in {utils.readable_time(time.time() - start_time)}')
         print(f'Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_acc:.4f}\n')
+
+    print("Testing best model...")
+    best_model = MAIA2Model(len(all_moves), elo_dict, cfg)
+    best_ckpt = torch.load(f'{save_root}best_model.pt', map_location=device)
+    best_model.load_state_dict(best_ckpt['model_state_dict'])
+    best_model.eval().to(device)
+
+    elo_accuracies = {i: {'correct': 0, 'total': 0} for i in range(len(elo_dict))}
+    new_transition_points = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            boards, labels, elos_self, elos_oppo, legal_moves, side_info, tps = [x.to(device) if torch.is_tensor(x) else x for x in batch]
+            
+            logits_maia, _, _ = best_model(boards, elos_self, elos_oppo)
+            _, predictions = calculate_accuracy(logits_maia, labels, legal_moves)
+            
+            for i in range(0, len(predictions), len(elo_dict)):
+                if i + len(elo_dict) <= len(predictions):
+                    batch_predictions = predictions[i:i+len(elo_dict)]
+                    batch_labels = labels[i:i+len(elo_dict)]
+                    batch_elos = elos_self[i:i+len(elo_dict)]
+                    
+                    tp = find_transition_point(batch_predictions, batch_labels, batch_elos.tolist())
+                    if tp != -1:
+                        new_transition_points.append(tp)
+                    
+                    for j in range(len(elo_dict)):
+                        elo_level = j
+                        is_correct = (batch_predictions[j] == batch_labels[j]).item()
+                        elo_accuracies[elo_level]['total'] += 1
+                        if is_correct:
+                            elo_accuracies[elo_level]['correct'] += 1
+    
+    print("\nModel accuracy per ELO level:")
+    for elo_level, stats in elo_accuracies.items():
+        if stats['total'] > 0:
+            accuracy = stats['correct'] / stats['total']
+            print(f"ELO level {elo_level}: {accuracy:.4f} ({stats['correct']}/{stats['total']})")
+    
+    print("\nTransition point distribution for best model:")
+    tp_counts = {}
+    for tp in new_transition_points:
+        if tp not in tp_counts:
+            tp_counts[tp] = 0
+        tp_counts[tp] += 1
+    
+    for tp, count in sorted(tp_counts.items()):
+        percentage = count / len(new_transition_points) * 100
+        print(f"Transition point {tp}: {count} positions ({percentage:.2f}%)")
+    
+    avg_transition_point = sum(tp for tp in new_transition_points if tp not in [0, 10]) / sum(1 for tp in new_transition_points if tp not in [0, 10]) if any(tp not in [0, 10] for tp in new_transition_points) else 0
+    print(f"Average transition point (model): {avg_transition_point:.2f}")
+    
+    print("\nComparison of baseline vs model:")
+    for elo_level in range(len(elo_dict)):
+        baseline_acc = baseline_accuracy[elo_level]
+        model_acc = elo_accuracies[elo_level]['correct'] / elo_accuracies[elo_level]['total'] if elo_accuracies[elo_level]['total'] > 0 else 0
+        diff = model_acc - baseline_acc
+        print(f"ELO level {elo_level}: Baseline {baseline_acc:.4f}, Model {model_acc:.4f}, Diff {diff:.4f}")
 
 if __name__=="__main__":
     run_ft()
