@@ -22,6 +22,8 @@ class ThreatAwareDataset(Dataset):
         self.elo_dict = utils.create_elo_dict()
         
         cache_path = csv_path.replace('.csv', '_defensive_threat_filtered.pkl')
+        # if is_test:
+        #     cache_path = csv_path.replace('.csv', '_defensive_threat_filtered_exclude_tp10.pkl')
         
         if os.path.exists(cache_path):
             with open(cache_path, 'rb') as f:
@@ -81,6 +83,13 @@ class ThreatAwareDataset(Dataset):
         legal_moves, side_info = utils.get_side_info(board, move, self.all_moves_dict)
         
         return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info, transition_point
+
+def is_square_under_offensive_threat(fen: str, square_index: int) -> bool:
+    board = chess.Board(fen)
+    piece = board.piece_at(square_index)
+    if piece is None or piece.color != chess.BLACK:
+        return False
+    return len(board.attackers(chess.WHITE, square_index)) > len(board.attackers(chess.BLACK, square_index))
 
 def is_square_under_defensive_threat(fen: str, square_index: int) -> bool:
     board = chess.Board(fen)
@@ -176,6 +185,9 @@ def run_ft():
         model.load_state_dict(ckpt['model_state_dict'])
         
     model.eval().to(device)
+    print("Freezing ELO embedding layer...")
+    for param in model.elo_embedding.parameters():
+        param.requires_grad = False
 
     train_dataset = ThreatAwareDataset(
         '../blundered-transitional-dataset/train_moves.csv',
