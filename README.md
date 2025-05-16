@@ -1,15 +1,15 @@
 # Mechanisms of Skill Adaptation in Generative Models: Chess as a Model System
 
-This repo contains the code for our paper investigating how generative models adapt their outputs to different skill levels to reveal whether adaptation occurs through dynamic internal concept understanding or through modulation of concept externalization.
+This repo contains the code for our paper investigating how generative models adapt their outputs to different skill levels to reveal whether adaptation occurs through dynamic internal concept awareness or through modulation of concept externalization.
 
-## Concept Externalization
+## Adjusting Concept Externalization
 
 ### Model Calibration
 
 Run with
 
 ```bash
-python -m maia2-sae.test.externalization.maia2_ft
+python -m maia2-skill-adaptation.test.externalization.maia2_ft
 ```
 
 to callibrate the concept externalization of model at lower skill levels to higher ones in move prediction.
@@ -19,7 +19,7 @@ to callibrate the concept externalization of model at lower skill levels to high
 We implement sparse and wide transcoders to simulate the behavior of the original model's FFN MLPs. The training process uses topK ReLU activations to directly control sparsity and mitigate dead latents. Run the transcoder training with:
 
 ```bash
-python -m maia2-sae.train.transcoder_train \
+python -m maia2-skill-adaptation.train.transcoder_train \
   --model_path /path/to/maia-2-weights \
   --data_root /path/to/lichess_data \
   --hidden_dim 16384 \
@@ -30,19 +30,19 @@ python -m maia2-sae.train.transcoder_train \
 After training, we can evaluate and visualize the reconstruction fidelity by:
 
 ```bash
-python -m maia2-sae.train.transcoder_eval
+python -m maia2-skill-adaptation.train.transcoder_eval
 ```
 
 and relevant codes for circuit analysis are included in test/externalization/circuit_analysis/.
 
-## Concept Intervention
+## Adjusting Concept Awareness
 
 ### SAE Training
 
 The training process supports the choice of SAE hyperparameters and hook sites to extract Maia-2 internal representations. To start a standard SAE training, run:
 
 ```bash
-python -m maia2-sae.train.train_sae [arguments]
+python -m maia2-skill-adaptation.train.train_sae [arguments]
 ```
 
 Key Arguments for SAE Training
@@ -59,13 +59,13 @@ The following arguments control the SAE training process:
 To get the internal activations of our trained SAEs on Maia-2 test positions, run
 
 ```bash
-python -m maia2-sae.train.generate_activations
+python -m maia2-skill-adaptation.train.generate_activations
 ```
 
 Then, with the SAE internals we can extract most salient SAE features for offensive and defensive square-wise threat concepts by:
 
 ```bash
-python -m maia2-sae.test.threat_awareness
+python -m maia2-skill-adaptation.test.threat_awareness
 ```
 
 ### Feature-Mediated Intervention
@@ -73,7 +73,7 @@ python -m maia2-sae.test.threat_awareness
 Run with:
 
 ```bash
-python -m maia2-sae.test.intervention.run_sae_intervention
+python -m maia2-skill-adaptation.test.intervention.run_sae_intervention
 ```
 
 to examine how model's behaviour changes when increasing the concept understanding level of it!
