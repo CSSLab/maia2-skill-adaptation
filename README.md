@@ -33,6 +33,8 @@ After training, we can evaluate and visualize the reconstruction fidelity by:
 python -m maia2-sae.train.transcoder_eval
 ```
 
+and relevant codes for circuit analysis are included in test/externalization/circuit_analysis/.
+
 ## Concept Intervention
 
 ### SAE Training
