@@ -1,0 +1,32 @@
+# Model Architecture
+input_channels: 18
+dim_cnn: 256
+dim_vit: 1024
+num_blocks_cnn: 5
+num_blocks_vit: 2
+vit_length: 8
+elo_dim: 128
+
+# Training Parameters
+seed: 42
+lr: 0.0001
+wd: 0.00001
+batch_size: 256
+max_epochs: 20
+patience: 3
+num_workers: 16
+verbose: 1
+
+# Model Features
+side_info: True
+side_info_coefficient: 1
+value: True
+value_coefficient: 1
+
+# Checkpointing
+pretrained_path: 'weights.v2.pt'  # relative to the repository root
+
+# Data Processing
+first_n_moves: 10
+last_n_moves: 10
+max_ply: 300
